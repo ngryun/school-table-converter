@@ -28,6 +28,7 @@ npm start
 ## 웹 배포
 
 이 프로젝트는 빌드 과정이 필요 없는 정적 사이트입니다. 배포 대상의 publish/output directory를 프로젝트 루트(`.`)로 지정하면 됩니다.
+오픈소스 라이선스 표기는 `THIRD_PARTY_NOTICES.md`에 정리되어 있습니다.
 
 ### Vercel
 

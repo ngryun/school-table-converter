@@ -107,6 +107,20 @@
     text-decoration: none;
     border-radius: 6px;
   }
+
+  footer {
+    margin-top: 18px;
+    font-size: 12px;
+    color: var(--muted);
+    text-align: center;
+  }
+
+  footer a {
+    color: var(--primary);
+    text-decoration: none;
+  }
+
+  footer a:hover { text-decoration: underline; }
 </style>
 </head>
 <body>
@@ -129,6 +143,10 @@
     <strong>로그</strong>
     <div id="log"></div>
   </div>
+
+  <footer>
+    <a href="THIRD_PARTY_NOTICES.md">오픈소스 라이선스</a>
+  </footer>
 
   <script src="lib/sheetjs/xlsx.full.min.js"></script>
   <script type="module" src="app.js?v=20260524-selection-note-target"></script>
