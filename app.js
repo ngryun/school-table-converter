@@ -66,6 +66,139 @@ function excelColName(idx) {
   return name;
 }
 
+function readSheetCellText(sheet, row, col) {
+  const addr = XLSX.utils.encode_cell({ r: row, c: col });
+  const cell = sheet[addr];
+  if (!cell) return '';
+  return (cell.w != null ? cell.w : (cell.v != null ? String(cell.v) : '')).trim();
+}
+
+function extractColumnWidthsExcel(sheet, arrayBuffer, startCol, colCount, sheetIndex = 0) {
+  const colsInfo = sheet['!cols'] || [];
+  const colWidthsExcel = [];
+  const colsInfoSamples = [];  // 진단용
+  let nonDefaultCount = 0;
+  for (let c = 0; c < colCount; c++) {
+    const sourceCol = startCol + c;
+    const info = colsInfo[sourceCol];
+    let w = 10;
+    if (info) {
+      colsInfoSamples.push(`[${sourceCol}]${JSON.stringify(info)}`);
+      if (typeof info.wch === 'number')       { w = info.wch;        nonDefaultCount++; }
+      else if (typeof info.width === 'number'){ w = info.width;      nonDefaultCount++; }
+      else if (typeof info.wpx === 'number')  { w = info.wpx / 7;    nonDefaultCount++; }
+    } else {
+      colsInfoSamples.push(`[${sourceCol}]undefined`);
+    }
+    colWidthsExcel.push(w);
+  }
+
+  // 정보가 충분치 않으면 worksheet XML을 우리가 직접 파싱 (확실한 폴백)
+  if (nonDefaultCount < colCount) {
+    const xmlFallback = parseColWidthsFromXlsxXml(sheet, arrayBuffer, sheetIndex);
+    if (xmlFallback && xmlFallback.length > 0) {
+      for (let c = 0; c < colCount; c++) {
+        const sourceCol = startCol + c;
+        if (xmlFallback[sourceCol] != null) colWidthsExcel[c] = xmlFallback[sourceCol];
+      }
+      nonDefaultCount = colCount;
+    }
+  }
+
+  console.log('[debug] !cols samples:', colsInfoSamples);
+  console.log('[debug] colWidthsExcel:', colWidthsExcel);
+  return colWidthsExcel;
+}
+
+function isCurriculumOrganizationCandidate(sheetName, sheet) {
+  const titleText = readSheetCellText(sheet, 1, 1); // B2
+  const compact = normalizeCompactText(`${sheetName} ${titleText}`);
+  return compact.includes('교육과정편제표');
+}
+
+function findLastDataRowInColumn(sheet, col, firstDataRow, maxRow) {
+  for (let row = maxRow; row >= firstDataRow; row--) {
+    if (readSheetCellText(sheet, row, col).length > 0) return row;
+  }
+  return -1;
+}
+
+function readCurriculumOrganizationTable(wb, arrayBuffer) {
+  const tableStartRow = 4; // B5
+  const titleRow = 1;      // B2
+  const startCol = 1;      // B
+  const endCol = 14;       // O
+  const colCount = endCol - startCol + 1;
+
+  for (let sheetIndex = 0; sheetIndex < wb.SheetNames.length; sheetIndex++) {
+    const sheetName = wb.SheetNames[sheetIndex];
+    const sheet = wb.Sheets[sheetName];
+    if (!sheet || !sheet['!ref']) continue;
+    if (!isCurriculumOrganizationCandidate(sheetName, sheet)) continue;
+
+    const range = XLSX.utils.decode_range(sheet['!ref']);
+    const lastDataRow = findLastDataRowInColumn(sheet, startCol, tableStartRow, range.e.r);
+    if (lastDataRow < tableStartRow) continue;
+
+    const rawRowCount = range.e.r - range.s.r + 1;
+    const rawColCount = range.e.c - range.s.c + 1;
+    const titleText = readSheetCellText(sheet, titleRow, startCol) || '교육과정편제표';
+    const tableDataRowCount = lastDataRow - tableStartRow + 1;
+    const cells = [];
+
+    for (let r = tableStartRow; r <= lastDataRow; r++) {
+      for (let c = startCol; c <= endCol; c++) {
+        const text = readSheetCellText(sheet, r, c);
+        if (text.length === 0) continue;
+        cells.push({
+          row: r - tableStartRow,
+          col: c - startCol,
+          text,
+        });
+      }
+    }
+
+    const merges = (sheet['!merges'] || [])
+      .filter(m =>
+        m.s.r >= tableStartRow && m.e.r <= lastDataRow &&
+        m.s.c >= startCol && m.e.c <= endCol
+      )
+      .map(m => ({
+        r1: m.s.r - tableStartRow,
+        c1: m.s.c - startCol,
+        r2: m.e.r - tableStartRow,
+        c2: m.e.c - startCol,
+      }));
+
+    const colWidthsExcel = extractColumnWidthsExcel(sheet, arrayBuffer, startCol, colCount, sheetIndex);
+    const tableRangeLabel = `B5:O${lastDataRow + 1}`;
+
+    return {
+      sheetName,
+      format: 'curriculumOrganization',
+      formatLabel: '교육과정편제표',
+      titleCell: 'B2',
+      titleText,
+      tableRangeLabel,
+      rowCount: tableDataRowCount,
+      colCount,
+      rawRowCount,
+      rawColCount,
+      cells,
+      merges,
+      colWidthsExcel,
+      droppedColIdx: [],
+      selectionRequirement: null,
+      trim: { r1: tableStartRow, c1: startCol, r2: lastDataRow, c2: endCol },
+      hasTitleRow: false,
+      headerRowCount: 2,
+      preserveZeroText: true,
+    };
+  }
+
+  return null;
+}
+
 // WASM/Rust에서 throw된 값은 Error가 아닐 수 있다. 강건하게 문자열화.
 function errMsg(e) {
   if (e == null) return 'null';
@@ -136,6 +269,9 @@ async function selftest() {
 // ────────────────────────────────────────────────────────────────
 function readXlsxFirstSheet(arrayBuffer) {
   const wb = XLSX.read(arrayBuffer, { type: 'array' });
+  const curriculumData = readCurriculumOrganizationTable(wb, arrayBuffer);
+  if (curriculumData) return curriculumData;
+
   const sheetName = wb.SheetNames[0];
   const sheet = wb.Sheets[sheetName];
   if (!sheet || !sheet['!ref']) throw new Error('첫 시트가 비어 있습니다.');
@@ -154,10 +290,7 @@ function readXlsxFirstSheet(arrayBuffer) {
   let maxRowWithData = -1;
   for (let r = 0; r < rawRowCount; r++) {
     for (let c = 0; c < rawColCount; c++) {
-      const addr = XLSX.utils.encode_cell({ r: r + rowOffset, c: c + colOffset });
-      const cell = sheet[addr];
-      if (!cell) continue;
-      const txt = (cell.w != null ? cell.w : (cell.v != null ? String(cell.v) : '')).trim();
+      const txt = readSheetCellText(sheet, r + rowOffset, c + colOffset);
       if (txt.length === 0) continue;
       cellsRaw.push({ row: r, col: c, text: txt });
       if (c < minColWithData) minColWithData = c;
@@ -226,39 +359,7 @@ function readXlsxFirstSheet(arrayBuffer) {
       c2: m.c2 - trim.c1,
     }));
 
-  // 열 너비 추출 — SheetJS의 !cols 엔트리는 보통 wpx/wch/width 중 일부만 가짐
-  const colsInfo = sheet['!cols'] || [];
-  const colWidthsExcel = [];
-  const colsInfoSamples = [];  // 진단용
-  let nonDefaultCount = 0;
-  for (let c = 0; c < effColCount; c++) {
-    const sourceCol = c + trim.c1;
-    const info = colsInfo[sourceCol + colOffset];
-    let w = 10;
-    if (info) {
-      colsInfoSamples.push(`[${sourceCol}]${JSON.stringify(info)}`);
-      if (typeof info.wch === 'number')       { w = info.wch;        nonDefaultCount++; }
-      else if (typeof info.width === 'number'){ w = info.width;      nonDefaultCount++; }
-      else if (typeof info.wpx === 'number')  { w = info.wpx / 7;    nonDefaultCount++; }
-    } else {
-      colsInfoSamples.push(`[${sourceCol}]undefined`);
-    }
-    colWidthsExcel.push(w);
-  }
-  // 정보가 충분치 않으면 worksheet XML을 우리가 직접 파싱 (확실한 폴백)
-  if (nonDefaultCount < effColCount) {
-    const xmlFallback = parseColWidthsFromXlsxXml(sheet, arrayBuffer);
-    if (xmlFallback && xmlFallback.length > 0) {
-      for (let c = 0; c < effColCount; c++) {
-        const sourceCol = c + trim.c1;
-        if (xmlFallback[sourceCol] != null) colWidthsExcel[c] = xmlFallback[sourceCol];
-      }
-      nonDefaultCount = effColCount;
-    }
-  }
-  // 진단 로그
-  console.log('[debug] !cols samples:', colsInfoSamples);
-  console.log('[debug] colWidthsExcel:', colWidthsExcel);
+  const colWidthsExcel = extractColumnWidthsExcel(sheet, arrayBuffer, trim.c1 + colOffset, effColCount, 0);
 
   const selectionGroupMoved = moveSelectionRequirementIntoGroupColumn({
     rowCount: effRowCount,
@@ -518,8 +619,8 @@ function moveSelectionRequirementIntoGroupColumn({ rowCount, colCount, cells, me
 }
 
 // SheetJS의 !cols 미흡 시 폴백: arrayBuffer에서 worksheet XML을 ZIP으로 다시 열어 <col> 태그를 직접 추출.
-// xlsx는 ZIP 컨테이너. JSZip 없이 SheetJS 내부 유틸을 빌려 첫 시트 XML만 가져온다.
-function parseColWidthsFromXlsxXml(sheet, arrayBuffer) {
+// xlsx는 ZIP 컨테이너. JSZip 없이 SheetJS 내부 유틸을 빌려 대상 시트 XML만 가져온다.
+function parseColWidthsFromXlsxXml(sheet, arrayBuffer, sheetIndex = 0) {
   try {
     // SheetJS는 압축 해제된 파일들을 wb.Strings 등에 보관하지 않으므로, ZIP을 직접 다시 풀어야 한다.
     // 가벼운 ZIP 디코더 대신 SheetJS의 raw 모드를 이용한다: XLSX.read with bookFiles=true
@@ -527,8 +628,11 @@ function parseColWidthsFromXlsxXml(sheet, arrayBuffer) {
     const wb = XLSX.read(arrayBuffer, { type: 'array', bookFiles: true });
     const files = wb.files || wb.Files || null;
     if (!files) return null;
-    // 첫 시트의 XML 파일명 찾기
-    const sheetKey = Object.keys(files).find(k => /xl\/worksheets\/sheet1\.xml$/i.test(k));
+    // 대상 시트의 XML 파일명 찾기
+    const sheetXmlName = `xl/worksheets/sheet${sheetIndex + 1}.xml`;
+    const sheetKey = Object.keys(files).find(k =>
+      k.replace(/^\/+/, '').toLowerCase() === sheetXmlName.toLowerCase()
+    );
     if (!sheetKey) return null;
     const xmlContent = files[sheetKey].content || files[sheetKey];
     const xml = (typeof xmlContent === 'string') ? xmlContent : new TextDecoder('utf-8').decode(xmlContent);
@@ -564,6 +668,8 @@ const TABLE_THEME = {
   indexText: '#243832',
   whiteText: '#FFFFFF',
 };
+
+const TABLE_FONT_FAMILY = '맑은 고딕';
 
 const BORDER_COLOR_BY_FILL_COLOR = {
   [TABLE_THEME.titleBg]: TABLE_THEME.titleBg,
@@ -608,6 +714,11 @@ function writeU32LE(bytes, offset, value) {
   bytes[offset + 1] = (value >>> 8) & 0xff;
   bytes[offset + 2] = (value >>> 16) & 0xff;
   bytes[offset + 3] = (value >>> 24) & 0xff;
+}
+
+function writeU16LE(bytes, offset, value) {
+  bytes[offset] = value & 0xff;
+  bytes[offset + 1] = (value >>> 8) & 0xff;
 }
 
 function concatBytes(chunks) {
@@ -731,6 +842,43 @@ async function applyHwpBorderFillColors(bytes, fillByBorderFillId) {
   return new Uint8Array(XLSX.CFB.write(cfb, { type: 'array' }));
 }
 
+function patchCharShapeFontFaceIds(record, fontFaceId) {
+  // HWPTAG_CHAR_SHAPE starts with 7 uint16 font face IDs
+  // for language categories: Hangul, Latin, Hanja, Japanese, Other, Symbol, User.
+  if (record.data.length < 14 || fontFaceId < 0 || fontFaceId > 0xffff) return false;
+  for (let i = 0; i < 7; i++) {
+    writeU16LE(record.data, i * 2, fontFaceId);
+  }
+  return true;
+}
+
+async function applyHwpCharShapeFont(bytes, fontFaceId) {
+  if (fontFaceId == null || fontFaceId < 0) return { bytes, patched: 0 };
+  if (!XLSX?.CFB) {
+    throw new Error('이 브라우저에서 HWP 글꼴 후처리를 지원하지 않습니다.');
+  }
+
+  const cfb = XLSX.CFB.read(bytes, { type: 'array' });
+  const docInfo = XLSX.CFB.find(cfb, 'DocInfo') || cfb.FileIndex.find(file => file.name === 'DocInfo');
+  if (!docInfo || !docInfo.content) throw new Error('DocInfo 스트림을 찾을 수 없습니다.');
+
+  const inflated = await transformRawDeflate(new Uint8Array(docInfo.content), 'inflate');
+  const records = parseHwpRecords(inflated);
+  let patched = 0;
+  for (const record of records) {
+    if (record.tag !== 21) continue; // HWPTAG_CHAR_SHAPE
+    if (patchCharShapeFontFaceIds(record, fontFaceId)) patched++;
+  }
+
+  if (patched === 0) return { bytes, patched };
+  docInfo.content = await transformRawDeflate(buildHwpRecords(records), 'deflate');
+  docInfo.size = docInfo.content.length;
+  return {
+    bytes: new Uint8Array(XLSX.CFB.write(cfb, { type: 'array' })),
+    patched,
+  };
+}
+
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, ch => ({
     '&': '&amp;',
@@ -783,6 +931,11 @@ function detectTitleRow(data) {
   return wideTopMerge && textCells.length <= 2;
 }
 
+function getHeaderRowCount(data, hasTitleRow) {
+  if (typeof data.headerRowCount === 'number') return Math.max(1, data.headerRowCount);
+  return hasTitleRow ? 2 : 1;
+}
+
 function buildStyledTableHtml(data, totalPx = 660) {
   const textByCell = new Map(data.cells.map(cell => [`${cell.row},${cell.col}`, cell.text]));
   const mergeStarts = new Map();
@@ -802,7 +955,8 @@ function buildStyledTableHtml(data, totalPx = 660) {
   }
 
   const colWidthsPx = computeCssColWidths(data.colWidthsExcel, totalPx);
-  const hasTitleRow = detectTitleRow(data);
+  const hasTitleRow = data.hasTitleRow ?? detectTitleRow(data);
+  const headerRowCount = getHeaderRowCount(data, hasTitleRow);
   const rowsToRender = [];
   for (let r = 0; r < data.rowCount; r++) {
     let hasRenderableCell = false;
@@ -831,7 +985,7 @@ function buildStyledTableHtml(data, totalPx = 660) {
       const rowSpan = span.endRow == null ? 1 : renderedRowSpan(r, span.endRow);
       const text = textByCell.get(`${r},${c}`) || '';
       const isTitle = hasTitleRow && r === 0;
-      const isHeader = (!hasTitleRow && r === 0) || (hasTitleRow && r === 1);
+      const isHeader = !isTitle && r < headerRowCount;
       const isIndex = !isTitle && !isHeader && c === 0;
       const kind = isTitle ? 'title' : isHeader ? 'header' : isIndex ? 'index' : 'body';
       const isOdd = r % 2 === 1;
@@ -851,7 +1005,7 @@ function buildStyledTableHtml(data, totalPx = 660) {
         background: kind === 'title'
           ? TABLE_THEME.titleBg
           : kind === 'header'
-            ? (c % 2 === 0 ? TABLE_THEME.headerBg : TABLE_THEME.headerBg2)
+            ? TABLE_THEME.headerBg
             : kind === 'index'
               ? (isOdd ? TABLE_THEME.indexOdd : TABLE_THEME.indexEven)
               : (isOdd ? TABLE_THEME.rowOdd : TABLE_THEME.rowEven),
@@ -875,16 +1029,16 @@ function buildStyledTableHtml(data, totalPx = 660) {
   return { html: html.join(''), cells, hasTitleRow };
 }
 
-function getTableCellKind(row, col, hasTitleRow) {
+function getTableCellKind(row, col, hasTitleRow, headerRowCount) {
   const isTitle = hasTitleRow && row === 0;
-  const isHeader = (!hasTitleRow && row === 0) || (hasTitleRow && row === 1);
+  const isHeader = !isTitle && row < headerRowCount;
   const isIndex = !isTitle && !isHeader && col === 0;
   return isTitle ? 'title' : isHeader ? 'header' : isIndex ? 'index' : 'body';
 }
 
 function getCellFillColor(kind, row, col) {
   if (kind === 'title') return TABLE_THEME.titleBg;
-  if (kind === 'header') return col % 2 === 0 ? TABLE_THEME.headerBg : TABLE_THEME.headerBg2;
+  if (kind === 'header') return TABLE_THEME.headerBg;
   if (kind === 'index') return row % 2 === 1 ? TABLE_THEME.indexOdd : TABLE_THEME.indexEven;
   return row % 2 === 1 ? TABLE_THEME.rowOdd : TABLE_THEME.rowEven;
 }
@@ -898,11 +1052,15 @@ function getCellBorderColor(kind, fillHex) {
   return TABLE_THEME.grid;
 }
 
-function getHeaderTextsByColumn(data, hasTitleRow) {
-  const headerRow = hasTitleRow ? 1 : 0;
+function getHeaderTextsByColumn(data, hasTitleRow, headerRowCount = getHeaderRowCount(data, hasTitleRow)) {
+  const firstHeaderRow = hasTitleRow ? 1 : 0;
+  const lastHeaderRow = Math.max(firstHeaderRow, headerRowCount - 1);
   const headers = new Array(data.colCount).fill('');
   for (const cell of data.cells) {
-    if (cell.row === headerRow) headers[cell.col] = cell.text.trim();
+    if (cell.row >= firstHeaderRow && cell.row <= lastHeaderRow) {
+      const text = cell.text.trim();
+      if (text) headers[cell.col] = headers[cell.col] ? `${headers[cell.col]} ${text}` : text;
+    }
   }
   return headers;
 }
@@ -910,8 +1068,9 @@ function getHeaderTextsByColumn(data, hasTitleRow) {
 function getColumnRole(headerText) {
   const h = headerText.replace(/\s+/g, '');
   if (h === '학점') return 'credit';
+  if (/기준학점|운영학점|이수단위|필수단위/.test(h)) return 'credit';
   if (/^\d+-\d+$/.test(h)) return 'term';
-  if (/학기별|학점수|과목수|최소선택/.test(h)) return 'term';
+  if (/학기별|학점수|과목수|최소선택|학년.*학기/.test(h)) return 'term';
   if (/선택그룹|그룹명/.test(h)) return 'selectionGroup';
   if (/과목구분|구분/.test(h)) return 'category';
   if (/교과/.test(h)) return 'group';
@@ -920,8 +1079,30 @@ function getColumnRole(headerText) {
   return 'default';
 }
 
-function computeHwpColWidths(data, hasTitleRow, availableWidth) {
-  const headers = getHeaderTextsByColumn(data, hasTitleRow);
+function computeCurriculumOrganizationColWidths(colCount, availableWidth) {
+  // B:O 고정 구조: 구분, 과목, 과목-일반/정보, 기준/운영, 6개 학기, 이수/필수 단위.
+  // 좁은 수치 열을 억지로 늘리지 않아 한글에서 한 페이지 안에 안정적으로 들어오게 한다.
+  const HWPUNIT_PER_MM = 283;
+  const widthsMm = [12, 15, 11, 28, 9, 9, 8, 8, 8, 8, 8, 8, 9, 9];
+  let widths = widthsMm.slice(0, colCount).map(mm => Math.round(mm * HWPUNIT_PER_MM));
+
+  if (colCount > widths.length) {
+    widths = widths.concat(new Array(colCount - widths.length).fill(Math.round(8 * HWPUNIT_PER_MM)));
+  }
+
+  const total = widths.reduce((sum, width) => sum + width, 0);
+  const scale = availableWidth / total;
+  const scaled = widths.map(width => Math.floor(width * scale));
+  scaled[scaled.length - 1] += availableWidth - scaled.reduce((sum, width) => sum + width, 0);
+  return scaled;
+}
+
+function computeHwpColWidths(data, hasTitleRow, availableWidth, headerRowCount = getHeaderRowCount(data, hasTitleRow)) {
+  if (data.format === 'curriculumOrganization') {
+    return computeCurriculumOrganizationColWidths(data.colCount, availableWidth);
+  }
+
+  const headers = getHeaderTextsByColumn(data, hasTitleRow, headerRowCount);
   const specByRole = {
     category: { min: 7600, weight: 1.05 },
     selectionGroup: { min: 9200, weight: 1.25 },
@@ -954,31 +1135,113 @@ function isZeroCreditText(text) {
   return /^0(?:\.0+)?$/.test(String(text).trim().replace(/,/g, ''));
 }
 
-function buildDisplayTextByCell(data, hasTitleRow) {
-  const headerRow = hasTitleRow ? 1 : 0;
-  const roles = getHeaderTextsByColumn(data, hasTitleRow).map(getColumnRole);
+function parseSelectionCreditLayout(text) {
+  const match = String(text ?? '').match(/^\s*(택\s*\d+)\s+(\d+(?:\.\d+)?)\s*학점\s*$/);
+  if (!match) return null;
+  const choice = match[1].replace(/\s+/g, '');
+  const credit = match[2];
+  const unit = '학점';
+  const paragraphs = [choice, credit, unit];
+  return {
+    text: paragraphs.join(''),
+    paragraphs,
+  };
+}
+
+function buildDisplayTextByCell(data, hasTitleRow, headerRowCount = getHeaderRowCount(data, hasTitleRow)) {
+  const lastHeaderRow = Math.max(0, headerRowCount - 1);
+  const roles = getHeaderTextsByColumn(data, hasTitleRow, headerRowCount).map(getColumnRole);
   const textByCell = new Map();
+  const selectionCreditByCell = new Map();
   let omittedZeroCount = 0;
 
   for (const cell of data.cells) {
-    let text = cell.text;
+    const key = `${cell.row},${cell.col}`;
+    const selectionCredit = parseSelectionCreditLayout(cell.text);
+    let text = selectionCredit ? selectionCredit.text : cell.text;
     const role = roles[cell.col];
-    if (cell.row > headerRow && (role === 'credit' || role === 'term') && isZeroCreditText(text)) {
+    if (!data.preserveZeroText && cell.row > lastHeaderRow && (role === 'credit' || role === 'term') && isZeroCreditText(text)) {
       text = '';
       omittedZeroCount++;
     }
-    textByCell.set(`${cell.row},${cell.col}`, text);
+    if (selectionCredit && text) selectionCreditByCell.set(key, selectionCredit);
+    textByCell.set(key, text);
   }
 
-  return { textByCell, omittedZeroCount };
+  return { textByCell, selectionCreditByCell, omittedZeroCount };
 }
 
-function createTableTextStyles(doc) {
+function createDocumentTitleStyle(doc) {
+  const styleId = doc.createStyle(JSON.stringify({
+    name: 'Document Title',
+    englishName: 'DocumentTitle',
+    type: 0,
+    nextStyleId: 0,
+  }));
+  doc.updateStyleShapes(
+    styleId,
+    JSON.stringify({
+      bold: true,
+      fontSize: 1500,
+      fontFamily: TABLE_FONT_FAMILY,
+      textColor: TABLE_THEME.text,
+    }),
+    JSON.stringify({ alignment: 'center', lineSpacing: 130 })
+  );
+  return styleId;
+}
+
+function insertDocumentTitle(doc, titleText) {
+  const title = String(titleText ?? '').trim();
+  if (!title) return 0;
+
+  const titleStyleId = createDocumentTitleStyle(doc);
+  parseJsonResult(doc.insertText(0, 0, 0, title), 'insertDocumentTitle');
+  parseJsonResult(doc.applyStyle(0, 0, titleStyleId), 'applyDocumentTitleStyle');
+  parseJsonResult(doc.applyParaFormat(0, 0, JSON.stringify({
+    alignment: 'center',
+    lineSpacing: 130,
+  })), 'applyDocumentTitlePara');
+  try {
+    parseJsonResult(doc.applyCharFormat(0, 0, 0, title.length, JSON.stringify({
+      bold: true,
+      fontSize: 1500,
+      fontFamily: TABLE_FONT_FAMILY,
+      textColor: TABLE_THEME.text,
+    })), 'applyDocumentTitleChar');
+  } catch (e) {
+    console.warn('[debug] 제목 글자 서식 일부 적용 실패:', e);
+  }
+  parseJsonResult(doc.splitParagraph(0, 0, title.length), 'splitParagraphAfterTitle');
+  return 1;
+}
+
+function insertCellParagraphs(doc, paraIdx, ctrlIdx, cellIdx, paragraphs, label) {
+  if (!paragraphs || paragraphs.length === 0) return;
+  parseJsonResult(
+    doc.insertTextInCell(0, paraIdx, ctrlIdx, cellIdx, 0, 0, paragraphs[0]),
+    `${label}:insertCellParagraph(0)`
+  );
+  for (let i = 1; i < paragraphs.length; i++) {
+    parseJsonResult(
+      doc.splitParagraphInCell(0, paraIdx, ctrlIdx, cellIdx, i - 1, paragraphs[i - 1].length),
+      `${label}:splitParagraph(${i})`
+    );
+    parseJsonResult(
+      doc.insertTextInCell(0, paraIdx, ctrlIdx, cellIdx, i, 0, paragraphs[i]),
+      `${label}:insertCellParagraph(${i})`
+    );
+  }
+}
+
+function createTableTextStyles(doc, data) {
+  const isCurriculum = data?.format === 'curriculumOrganization';
   const defs = {
-    title:  { name: 'Minimal Title',  char: { bold: true, fontSize: 1080, textColor: TABLE_THEME.whiteText } },
-    header: { name: 'Minimal Header', char: { bold: true, fontSize: 980, textColor: TABLE_THEME.whiteText } },
-    index:  { name: 'Minimal Index',  char: { bold: true, fontSize: 910, textColor: TABLE_THEME.indexText } },
-    body:   { name: 'Minimal Body',   char: { bold: false, fontSize: 900, textColor: TABLE_THEME.text } },
+    title:  { name: 'Minimal Title',  char: { bold: true, fontSize: 1080, fontFamily: TABLE_FONT_FAMILY, textColor: TABLE_THEME.whiteText } },
+    header: { name: 'Minimal Header', char: { bold: true, fontSize: isCurriculum ? 760 : 930, fontFamily: TABLE_FONT_FAMILY, textColor: TABLE_THEME.whiteText } },
+    index:  { name: 'Minimal Index',  char: { bold: true, fontSize: isCurriculum ? 820 : 880, fontFamily: TABLE_FONT_FAMILY, textColor: TABLE_THEME.indexText } },
+    body:   { name: 'Minimal Body',   char: { bold: false, fontSize: isCurriculum ? 820 : 860, fontFamily: TABLE_FONT_FAMILY, textColor: TABLE_THEME.text } },
+    selectionCredit: { name: 'Selection Credit', char: { bold: true, fontSize: isCurriculum ? 860 : 900, fontFamily: TABLE_FONT_FAMILY, textColor: TABLE_THEME.text } },
   };
 
   const styleIds = {};
@@ -1008,7 +1271,9 @@ async function convertSelectedFile() {
     const buf = await f.arrayBuffer();
     const data = readXlsxFirstSheet(buf);
     log(`시트="${data.sheetName}"  원본 ${data.rawRowCount}×${data.rawColCount} → 표 ${data.rowCount}×${data.colCount}  값셀=${data.cells.length}  병합=${data.merges.length}`);
-    if (data.trim && (data.trim.r1 > 0 || data.trim.c1 > 0)) {
+    if (data.formatLabel) {
+      log(`${data.formatLabel} 양식 감지: 제목 ${data.titleCell}, 표 ${data.tableRangeLabel}`, 'ok');
+    } else if (data.trim && (data.trim.r1 > 0 || data.trim.c1 > 0)) {
       log(`앞쪽 빈 행/열 제거: 시작 셀 ${excelColName(data.trim.c1)}${data.trim.r1 + 1}`, 'muted');
     }
     if (data.droppedColIdx && data.droppedColIdx.length > 0) {
@@ -1028,6 +1293,13 @@ async function convertSelectedFile() {
 
     const doc = makeBlankDoc();
     log('빈 문서 골격 준비 OK');
+    let tableFontFaceId = -1;
+    try {
+      tableFontFaceId = doc.findOrCreateFontId(TABLE_FONT_FAMILY);
+      log(`문서 글꼴 등록: ${TABLE_FONT_FAMILY} (fontId=${tableFontFaceId})`, 'muted');
+    } catch (e) {
+      log(`문서 글꼴 등록 실패: ${errMsg(e)}`, 'err');
+    }
 
     // 0) 페이지 여백 최소화 — 사방 10mm.
     // 열이 많은 시간표는 가로 방향으로 만들어 표가 오른쪽으로 잘리지 않게 한다.
@@ -1051,22 +1323,30 @@ async function convertSelectedFile() {
     })), 'setPageDef');
     log(`용지: ${useLandscape ? '가로' : '세로'} / 여백 사방 10mm`);
 
+    const tableParaIdx = insertDocumentTitle(doc, data.titleText);
+    if (data.titleText) {
+      log(`문서 제목 삽입: "${data.titleText}"`, 'muted');
+    }
+
     // 1) 표 생성 — 한컴 한글에서 가장 안정적으로 보이는 rhwp 네이티브 표 경로를 사용한다.
     //    HTML import는 배경색은 잘 먹지만 일부 파일에서 [표] 앵커만 남는 렌더링 문제가 있었다.
     const r = parseJsonResult(
-      doc.createTable(0, 0, 0, data.rowCount, data.colCount),
+      doc.createTable(0, tableParaIdx, 0, data.rowCount, data.colCount),
       'createTable'
     );
     const paraIdx = r.paraIdx ?? 0;
     const ctrlIdx = r.controlIdx ?? 0;
-    const hasTitleRow = detectTitleRow(data);
+    const hasTitleRow = data.hasTitleRow ?? detectTitleRow(data);
+    const headerRowCount = getHeaderRowCount(data, hasTitleRow);
     const pageContentWidth = pageWidth - (MIN_MARGIN * 2);
     // 한글 일부 환경에서 용지 방향이 늦게/다르게 반영되어도 넘치지 않도록,
     // 열폭은 세로 A4 본문 폭을 기준으로 한 번 더 안전하게 제한한다.
     const portraitSafeWidth = PAGE_SHORT - (MIN_MARGIN * 2) - 1200;
-    const tableWidth = Math.max(24000, Math.min(pageContentWidth - 1200, portraitSafeWidth));
-    const targetColWidths = computeHwpColWidths(data, hasTitleRow, tableWidth);
-    const { textByCell, omittedZeroCount } = buildDisplayTextByCell(data, hasTitleRow);
+    const tableWidth = data.format === 'curriculumOrganization'
+      ? Math.max(36000, Math.min(pageContentWidth - 2600, portraitSafeWidth - 500))
+      : Math.max(24000, Math.min(pageContentWidth - 1200, portraitSafeWidth));
+    const targetColWidths = computeHwpColWidths(data, hasTitleRow, tableWidth, headerRowCount);
+    const { textByCell, selectionCreditByCell, omittedZeroCount } = buildDisplayTextByCell(data, hasTitleRow, headerRowCount);
     log(`createTable(${data.rowCount}×${data.colCount}) OK  paraIdx=${paraIdx} ctrlIdx=${ctrlIdx}`);
     log(`열폭 최적화: [${targetColWidths.map(w => (w / HWPUNIT_PER_MM).toFixed(1) + 'mm').join(', ')}]`, 'muted');
     if (omittedZeroCount > 0) {
@@ -1074,6 +1354,8 @@ async function convertSelectedFile() {
     }
     if (hasTitleRow) {
       log('상단 병합 제목 행 감지: 2행을 헤더 색상으로 처리', 'muted');
+    } else if (headerRowCount > 1) {
+      log(`다중 헤더 감지: 상단 ${headerRowCount}행을 헤더 색상으로 처리`, 'muted');
     }
 
     // 표 속성: 행 단위 페이지 분할 + 머리행 반복
@@ -1087,13 +1369,19 @@ async function convertSelectedFile() {
     let textFilled = 0, textErrors = 0;
     for (const { row, col } of data.cells) {
       const cellIdx = row * data.colCount + col;
-      const text = textByCell.get(`${row},${col}`) || '';
+      const key = `${row},${col}`;
+      const text = textByCell.get(key) || '';
       if (text.length === 0) continue;
       try {
-        parseJsonResult(
-          doc.insertTextInCell(0, paraIdx, ctrlIdx, cellIdx, 0, 0, text),
-          `insertTextInCell(r=${row},c=${col})`
-        );
+        const selectionCredit = selectionCreditByCell.get(key);
+        if (selectionCredit) {
+          insertCellParagraphs(doc, paraIdx, ctrlIdx, cellIdx, selectionCredit.paragraphs, `insertSelectionCredit(r=${row},c=${col})`);
+        } else {
+          parseJsonResult(
+            doc.insertTextInCell(0, paraIdx, ctrlIdx, cellIdx, 0, 0, text),
+            `insertTextInCell(r=${row},c=${col})`
+          );
+        }
         textFilled++;
       } catch (e) {
         textErrors++;
@@ -1104,10 +1392,11 @@ async function convertSelectedFile() {
 
     // 3) 서식 — 네이티브 표를 유지하되, 셀별 BorderFill ID를 모아
     //    export 후 HWP DocInfo의 채우기 레코드를 보정한다.
-    const styleIdsByKind = createTableTextStyles(doc);
+    const styleIdsByKind = createTableTextStyles(doc, data);
     log('텍스트 스타일: 헤더 흰색 / 본문 절제형 적용', 'muted');
 
-    const centerParaProps  = JSON.stringify({ alignment: 'center' });
+    const centerParaProps  = JSON.stringify({ alignment: 'center', lineSpacing: 120 });
+    const headerParaProps  = JSON.stringify({ alignment: 'center', lineSpacing: 100 });
     const fillByBorderFillId = new Map();
 
     parseJsonResult(doc.beginBatch(), 'beginBatch(format)');
@@ -1115,8 +1404,10 @@ async function convertSelectedFile() {
     for (let row = 0; row < data.rowCount; row++) {
       for (let col = 0; col < data.colCount; col++) {
         const cellIdx = row * data.colCount + col;
-        const text = textByCell.get(`${row},${col}`) || '';
-        const kind = getTableCellKind(row, col, hasTitleRow);
+        const key = `${row},${col}`;
+        const text = textByCell.get(key) || '';
+        const selectionCredit = selectionCreditByCell.get(key);
+        const kind = getTableCellKind(row, col, hasTitleRow, headerRowCount);
         try {
           try {
             const beforeCellProps = JSON.parse(doc.getCellProperties(0, paraIdx, ctrlIdx, cellIdx));
@@ -1125,13 +1416,13 @@ async function convertSelectedFile() {
             parseJsonResult(
               doc.setCellProperties(0, paraIdx, ctrlIdx, cellIdx, JSON.stringify({
                 width: targetColWidths[col] || beforeCellProps.width,
-                height: beforeCellProps.height,
+                height: Math.max(beforeCellProps.height || 0, kind === 'header' ? 1750 : 1280),
                 isHeader: kind === 'title' || kind === 'header',
                 verticalAlign: 1,
-                paddingLeft: 260,
-                paddingRight: 260,
-                paddingTop: 120,
-                paddingBottom: 120,
+                paddingLeft: kind === 'header' ? 120 : 220,
+                paddingRight: kind === 'header' ? 120 : 220,
+                paddingTop: kind === 'header' ? 80 : 140,
+                paddingBottom: kind === 'header' ? 80 : 140,
                 borderLeft: { type: 1, width: 1, color: borderColor },
                 borderRight: { type: 1, width: 1, color: borderColor },
                 borderTop: { type: 1, width: 1, color: borderColor },
@@ -1146,18 +1437,24 @@ async function convertSelectedFile() {
             }
             fillByBorderFillId.set(afterCellProps.borderFillId, fillColor);
           } catch (_) {}
-          parseJsonResult(
-            doc.applyParaFormatInCell(0, paraIdx, ctrlIdx, cellIdx, 0, centerParaProps),
-            `applyParaFormatInCell(r=${row},c=${col})`
-          );
-          fmtParaOk++;
-          if (text.length > 0) {
+          const paragraphTexts = selectionCredit ? selectionCredit.paragraphs : [text];
+          for (let cellParaIdx = 0; cellParaIdx < paragraphTexts.length; cellParaIdx++) {
+            const paragraphText = paragraphTexts[cellParaIdx] || '';
+            if (paragraphText.length > 0) {
+              const styleKey = selectionCredit && cellParaIdx === 1 ? 'selectionCredit' : kind;
+              parseJsonResult(
+                doc.applyCellStyle(0, paraIdx, ctrlIdx, cellIdx, cellParaIdx,
+                  styleIdsByKind[styleKey] ?? styleIdsByKind.body),
+                `applyCellStyle(r=${row},c=${col},p=${cellParaIdx})`
+              );
+              fmtStyleOk++;
+            }
+            const paraProps = kind === 'header' ? headerParaProps : centerParaProps;
             parseJsonResult(
-              doc.applyCellStyle(0, paraIdx, ctrlIdx, cellIdx, 0,
-                styleIdsByKind[kind] ?? styleIdsByKind.body),
-              `applyCellStyle(r=${row},c=${col})`
+              doc.applyParaFormatInCell(0, paraIdx, ctrlIdx, cellIdx, cellParaIdx, paraProps),
+              `applyParaFormatInCell(center,r=${row},c=${col},p=${cellParaIdx})`
             );
-            fmtStyleOk++;
+            fmtParaOk++;
           }
         } catch (e) {
           fmtErr++;
@@ -1198,9 +1495,16 @@ async function convertSelectedFile() {
     } catch (e) {
       log(`색상 후처리 실패: ${errMsg(e)}`, 'err');
     }
+    try {
+      const fontResult = await applyHwpCharShapeFont(bytes, tableFontFaceId);
+      bytes = fontResult.bytes;
+      log(`글꼴 후처리: CharShape ${fontResult.patched}개를 ${TABLE_FONT_FAMILY}(으)로 보정`, 'ok');
+    } catch (e) {
+      log(`글꼴 후처리 실패: ${errMsg(e)}`, 'err');
+    }
     log(`exportHwp() OK  ${bytes.length} bytes`, 'ok');
 
-    const outName = f.name.replace(/\.(xlsx|xls)$/i, '') + '.hwp';
+    const outName = f.name.replace(/\.(xlsx|xls|xlsm)$/i, '') + '.hwp';
     downloadBytes(bytes, outName);
     doc.free();
   } catch (e) {
