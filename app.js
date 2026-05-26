@@ -9,6 +9,7 @@ const $file = document.getElementById('file');
 const $btnConvert = document.getElementById('btnConvert');
 const $btnSelftest = document.getElementById('btnSelftest');
 const $dlSlot = document.getElementById('dlSlot');
+const $results = document.getElementById('results');
 
 function log(msg, cls = '') {
   const line = document.createElement('div');
@@ -31,6 +32,23 @@ function downloadBytes(bytes, filename) {
   $dlSlot.appendChild(a);
   // 자동 클릭으로 즉시 저장
   a.click();
+}
+
+function makeDownloadLink(bytes, filename) {
+  const blob = new Blob([bytes], { type: 'application/x-hwp' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.textContent = `↓ ${filename} 다운로드`;
+  a.className = 'dl';
+  return a;
+}
+
+function resetResults() {
+  if (!$results) return;
+  $results.innerHTML = '';
+  $results.hidden = true;
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -392,14 +410,21 @@ async function selftest() {
 // ────────────────────────────────────────────────────────────────
 // xlsx 파싱 → 시트 데이터 추출
 // ────────────────────────────────────────────────────────────────
-function readXlsxFirstSheet(arrayBuffer) {
+function readXlsxTables(arrayBuffer) {
   const wb = XLSX.read(arrayBuffer, { type: 'array' });
-  const curriculumLandscapeData = readCurriculumOrganizationLandscapeTable(wb, arrayBuffer);
-  if (curriculumLandscapeData) return curriculumLandscapeData;
-
   const curriculumData = readCurriculumOrganizationTable(wb, arrayBuffer);
-  if (curriculumData) return curriculumData;
+  const curriculumLandscapeData = readCurriculumOrganizationLandscapeTable(wb, arrayBuffer);
+  const detectedTables = [curriculumData, curriculumLandscapeData].filter(Boolean);
+  if (detectedTables.length > 0) return detectedTables;
 
+  return [readGenericFirstSheetTable(wb, arrayBuffer)];
+}
+
+function readXlsxFirstSheet(arrayBuffer) {
+  return readXlsxTables(arrayBuffer)[0];
+}
+
+function readGenericFirstSheetTable(wb, arrayBuffer) {
   const sheetName = wb.SheetNames[0];
   const sheet = wb.Sheets[sheetName];
   if (!sheet || !sheet['!ref']) throw new Error('첫 시트가 비어 있습니다.');
@@ -1368,7 +1393,10 @@ function getHeaderRowCount(data, hasTitleRow) {
 }
 
 function buildStyledTableHtml(data, totalPx = 660) {
-  const textByCell = new Map(data.cells.map(cell => [`${cell.row},${cell.col}`, cell.text]));
+  const colWidthsPx = computeCssColWidths(data.colWidthsExcel, totalPx);
+  const hasTitleRow = data.hasTitleRow ?? detectTitleRow(data);
+  const headerRowCount = getHeaderRowCount(data, hasTitleRow);
+  const { textByCell } = buildDisplayTextByCell(data, hasTitleRow, headerRowCount);
   const mergeStarts = new Map();
   const covered = new Set();
 
@@ -1385,9 +1413,6 @@ function buildStyledTableHtml(data, totalPx = 660) {
     }
   }
 
-  const colWidthsPx = computeCssColWidths(data.colWidthsExcel, totalPx);
-  const hasTitleRow = data.hasTitleRow ?? detectTitleRow(data);
-  const headerRowCount = getHeaderRowCount(data, hasTitleRow);
   const rowsToRender = [];
   for (let r = 0; r < data.rowCount; r++) {
     let hasRenderableCell = false;
@@ -1419,7 +1444,8 @@ function buildStyledTableHtml(data, totalPx = 660) {
       const isHeader = !isTitle && r < headerRowCount;
       const isIndex = !isTitle && !isHeader && c === 0;
       const kind = isTitle ? 'title' : isHeader ? 'header' : isIndex ? 'index' : 'body';
-      const isOdd = r % 2 === 1;
+      const fillColor = getCellFillColor(kind, r, c, data, text);
+      const textFormat = getExcelTextFormat(data, r, c);
       const widthPx = colWidthsPx
         .slice(c, c + span.colSpan)
         .reduce((a, b) => a + b, 0) || 80 * span.colSpan;
@@ -1433,13 +1459,9 @@ function buildStyledTableHtml(data, totalPx = 660) {
         'vertical-align': 'middle',
         'word-break': 'keep-all',
         'overflow-wrap': 'break-word',
-        background: kind === 'title'
-          ? TABLE_THEME.titleBg
-          : kind === 'header'
-            ? TABLE_THEME.headerBg
-            : kind === 'index'
-              ? (isOdd ? TABLE_THEME.indexOdd : TABLE_THEME.indexEven)
-              : (isOdd ? TABLE_THEME.rowOdd : TABLE_THEME.rowEven),
+        background: fillColor,
+        color: textFormat.textColor || (kind === 'index' ? TABLE_THEME.indexText : TABLE_THEME.text),
+        'font-weight': textFormat.bold || kind === 'title' || kind === 'header' || kind === 'index' ? '700' : '400',
       };
 
       const tag = kind === 'body' || kind === 'index' ? 'td' : 'th';
@@ -1854,42 +1876,95 @@ function createTableTextStyles(doc, data) {
 }
 
 // ────────────────────────────────────────────────────────────────
-// 본 변환: 첫 시트 전체 → HWP 표
+// 본 변환: 감지한 양식별 HWP 생성 + 미리보기
 // ────────────────────────────────────────────────────────────────
-async function convertSelectedFile() {
+function logTableDataInfo(data) {
+  log(`시트="${data.sheetName}"  원본 ${data.rawRowCount}×${data.rawColCount} → 표 ${data.rowCount}×${data.colCount}  값셀=${data.cells.length}  병합=${data.merges.length}`);
+  if (data.formatLabel) {
+    log(`${data.formatLabel} 양식 감지: 제목 ${data.titleCell}, 표 ${data.tableRangeLabel}`, 'ok');
+  } else if (data.trim && (data.trim.r1 > 0 || data.trim.c1 > 0)) {
+    log(`앞쪽 빈 행/열 제거: 시작 셀 ${excelColName(data.trim.c1)}${data.trim.r1 + 1}`, 'muted');
+  }
+  if (data.droppedColIdx && data.droppedColIdx.length > 0) {
+    const baseCol = data.trim ? data.trim.c1 : 0;
+    const labels = data.droppedColIdx.map(c => `${excelColName(baseCol + c)}(${baseCol + c})`).join(', ');
+    log(`자동 제거된 빈 데이터 열: ${labels}`, 'muted');
+  }
+  if (data.selectionRequirement?.movedCount > 0) {
+    const dropped = data.selectionRequirement.droppedColIdx.length > 0
+      ? ` / 원래 안내 열 ${data.selectionRequirement.droppedColIdx.length}개 제거`
+      : '';
+    log(`선택그룹명으로 학기별 선택조건 이동: ${data.selectionRequirement.movedCount}건${dropped}`, 'muted');
+  } else if (data.selectionRequirement?.skippedCount > 0) {
+    log('학기별 선택조건 문구를 찾았지만 선택그룹명 열을 찾지 못해 이동하지 않았습니다.', 'muted');
+  }
+  if (data.excelStyleByCell?.size > 0) {
+    log(`엑셀 셀 색상/글자색 감지: ${data.excelStyleByCell.size}칸`, 'muted');
+  }
+  log(`엑셀 열폭: [${data.colWidthsExcel.map(w => w.toFixed(1)).join(', ')}]`, 'muted');
+}
+
+function sanitizeFileNamePart(value) {
+  return String(value ?? '변환')
+    .replace(/[\\/:*?"<>|]/g, '_')
+    .replace(/\s+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '') || '변환';
+}
+
+function outputFileNameForData(sourceName, data, index, total) {
+  const base = sourceName.replace(/\.(xlsx|xls|xlsm)$/i, '');
+  if (total === 1 && !data.formatLabel) return `${base}.hwp`;
+
+  const suffix = data.format === 'curriculumOrganizationLandscape'
+    ? '교육과정편제표_가로'
+    : data.format === 'curriculumOrganization'
+    ? '교육과정편제표'
+    : sanitizeFileNamePart(data.sheetName || `양식_${index + 1}`);
+  return `${base}_${suffix}.hwp`;
+}
+
+function renderConversionResults(results) {
+  if (!$results) return;
+  $results.innerHTML = '';
+  $results.hidden = results.length === 0;
+  $dlSlot.innerHTML = results.length > 0
+    ? `<span class="muted">아래 미리보기에서 양식별로 다운로드하세요.</span>`
+    : '';
+
+  for (const result of results) {
+    const { data, bytes, outName } = result;
+    const card = document.createElement('section');
+    card.className = 'result-card';
+
+    const head = document.createElement('div');
+    head.className = 'result-head';
+
+    const title = document.createElement('div');
+    title.className = 'result-title';
+    const strong = document.createElement('strong');
+    strong.textContent = data.formatLabel || data.sheetName || '변환 결과';
+    const meta = document.createElement('span');
+    meta.className = 'muted';
+    meta.textContent = `${data.sheetName} · ${data.rowCount}행 × ${data.colCount}열 · ${(bytes.length / 1024).toFixed(1)}KB`;
+    title.append(strong, meta);
+    head.append(title, makeDownloadLink(bytes, outName));
+
+    const preview = document.createElement('div');
+    preview.className = 'preview-wrap';
+    const previewWidth = data.format === 'curriculumOrganizationLandscape' ? 1800 : 980;
+    preview.innerHTML = buildStyledTableHtml(data, previewWidth).html;
+
+    card.append(head, preview);
+    $results.appendChild(card);
+  }
+}
+
+async function buildHwpForTableData(data) {
+  logTableDataInfo(data);
+
+  const doc = makeBlankDoc();
   try {
-    await ensureWasm();
-    const f = $file.files[0];
-    if (!f) { log('파일 미선택', 'err'); return; }
-    log(`--- 변환 시작: ${f.name} ---`);
-
-    const buf = await f.arrayBuffer();
-    const data = readXlsxFirstSheet(buf);
-    log(`시트="${data.sheetName}"  원본 ${data.rawRowCount}×${data.rawColCount} → 표 ${data.rowCount}×${data.colCount}  값셀=${data.cells.length}  병합=${data.merges.length}`);
-    if (data.formatLabel) {
-      log(`${data.formatLabel} 양식 감지: 제목 ${data.titleCell}, 표 ${data.tableRangeLabel}`, 'ok');
-    } else if (data.trim && (data.trim.r1 > 0 || data.trim.c1 > 0)) {
-      log(`앞쪽 빈 행/열 제거: 시작 셀 ${excelColName(data.trim.c1)}${data.trim.r1 + 1}`, 'muted');
-    }
-    if (data.droppedColIdx && data.droppedColIdx.length > 0) {
-      const baseCol = data.trim ? data.trim.c1 : 0;
-      const labels = data.droppedColIdx.map(c => `${excelColName(baseCol + c)}(${baseCol + c})`).join(', ');
-      log(`자동 제거된 빈 데이터 열: ${labels}`, 'muted');
-    }
-    if (data.selectionRequirement?.movedCount > 0) {
-      const dropped = data.selectionRequirement.droppedColIdx.length > 0
-        ? ` / 원래 안내 열 ${data.selectionRequirement.droppedColIdx.length}개 제거`
-        : '';
-      log(`선택그룹명으로 학기별 선택조건 이동: ${data.selectionRequirement.movedCount}건${dropped}`, 'muted');
-    } else if (data.selectionRequirement?.skippedCount > 0) {
-      log('학기별 선택조건 문구를 찾았지만 선택그룹명 열을 찾지 못해 이동하지 않았습니다.', 'muted');
-    }
-    if (data.excelStyleByCell?.size > 0) {
-      log(`엑셀 셀 색상/글자색 감지: ${data.excelStyleByCell.size}칸`, 'muted');
-    }
-    log(`엑셀 열폭: [${data.colWidthsExcel.map(w => w.toFixed(1)).join(', ')}]`, 'muted');
-
-    const doc = makeBlankDoc();
     log('빈 문서 골격 준비 OK');
     let tableFontFaceId = -1;
     try {
@@ -1899,12 +1974,10 @@ async function convertSelectedFile() {
       log(`문서 글꼴 등록 실패: ${errMsg(e)}`, 'err');
     }
 
-    // 0) 페이지 여백 최소화 — 사방 10mm.
-    // 열이 많은 시간표는 가로 방향으로 만들어 표가 오른쪽으로 잘리지 않게 한다.
     const HWPUNIT_PER_MM = 283;
     const PAGE_SHORT = 59528;
     const PAGE_LONG = 84186;
-    const MIN_MARGIN = 10 * HWPUNIT_PER_MM;  // 10mm = 2830 HWPUNIT
+    const MIN_MARGIN = 10 * HWPUNIT_PER_MM;
     const useLandscape = !!data.forceLandscape || data.colCount >= 8;
     const pageDefWidth = PAGE_SHORT;
     const pageDefHeight = PAGE_LONG;
@@ -1927,8 +2000,6 @@ async function convertSelectedFile() {
       log(`문서 제목 삽입: "${data.titleText}"`, 'muted');
     }
 
-    // 1) 표 생성 — 한컴 한글에서 가장 안정적으로 보이는 rhwp 네이티브 표 경로를 사용한다.
-    //    HTML import는 배경색은 잘 먹지만 일부 파일에서 [표] 앵커만 남는 렌더링 문제가 있었다.
     const r = parseJsonResult(
       doc.createTable(0, tableParaIdx, 0, data.rowCount, data.colCount),
       'createTable'
@@ -1938,8 +2009,6 @@ async function convertSelectedFile() {
     const hasTitleRow = data.hasTitleRow ?? detectTitleRow(data);
     const headerRowCount = getHeaderRowCount(data, hasTitleRow);
     const pageContentWidth = layoutPageWidth - (MIN_MARGIN * 2);
-    // 한글 일부 환경에서 용지 방향이 늦게/다르게 반영되어도 넘치지 않도록,
-    // 열폭은 세로 A4 본문 폭을 기준으로 한 번 더 안전하게 제한한다.
     const portraitSafeWidth = PAGE_SHORT - (MIN_MARGIN * 2) - 1200;
     const tableWidth = data.format === 'curriculumOrganizationLandscape'
       ? Math.max(52000, pageContentWidth - 500)
@@ -1959,14 +2028,12 @@ async function convertSelectedFile() {
       log(`다중 헤더 감지: 상단 ${headerRowCount}행을 헤더 색상으로 처리`, 'muted');
     }
 
-    // 표 속성: 행 단위 페이지 분할 + 머리행 반복
     parseJsonResult(doc.setTableProperties(0, paraIdx, ctrlIdx, JSON.stringify({
-      pageBreak: 2,           // RowBreak
+      pageBreak: 2,
       repeatHeader: true,
     })), 'setTableProperties');
     log('표 속성: pageBreak=RowBreak, repeatHeader=true');
 
-    // 2) 텍스트 삽입 (병합 전에는 cellIdx = row * colCount + col)
     let textFilled = 0, textErrors = 0;
     for (const { row, col } of data.cells) {
       const cellIdx = row * data.colCount + col;
@@ -1992,8 +2059,6 @@ async function convertSelectedFile() {
     }
     log(`텍스트 삽입: 성공 ${textFilled} / 실패 ${textErrors}`);
 
-    // 3) 서식 — 네이티브 표를 유지하되, 셀별 BorderFill ID를 모아
-    //    export 후 HWP DocInfo의 채우기 레코드를 보정한다.
     const isLandscapeCurriculum = data.format === 'curriculumOrganizationLandscape';
     const styleIdsByKind = createTableTextStyles(doc, data);
     log(`텍스트 스타일: ${isLandscapeCurriculum ? '가로 편제표 본문 5.5pt' : '본문 절제형'} 적용`, 'muted');
@@ -2088,7 +2153,6 @@ async function convertSelectedFile() {
     log(`서식 적용: 스타일 ${fmtStyleOk} / 문단 ${fmtParaOk} / 실패 ${fmtErr}`);
     log(`색상 처리: 셀 배경 ${fillByBorderFillId.size}개 추적${data.excelStyleByCell?.size ? ' / Excel 색상 우선 적용' : ''}`, 'muted');
 
-    // 4) 병합을 마지막에 적용 (큰 영역 우선)
     const sortedMerges = [...data.merges].sort((a, b) => {
       const areaA = (a.r2 - a.r1 + 1) * (a.c2 - a.c1 + 1);
       const areaB = (b.r2 - b.r1 + 1) * (b.c2 - b.c1 + 1);
@@ -2125,10 +2189,37 @@ async function convertSelectedFile() {
       log(`글꼴 후처리 실패: ${errMsg(e)}`, 'err');
     }
     log(`exportHwp() OK  ${bytes.length} bytes`, 'ok');
-
-    const outName = f.name.replace(/\.(xlsx|xls|xlsm)$/i, '') + '.hwp';
-    downloadBytes(bytes, outName);
+    return bytes;
+  } finally {
     doc.free();
+  }
+}
+
+async function convertSelectedFile() {
+  try {
+    await ensureWasm();
+    const f = $file.files[0];
+    if (!f) { log('파일 미선택', 'err'); return; }
+    $dlSlot.innerHTML = '';
+    resetResults();
+    log(`--- 변환 시작: ${f.name} ---`);
+
+    const buf = await f.arrayBuffer();
+    const tables = readXlsxTables(buf);
+    log(`생성 대상 양식: ${tables.length}개`, tables.length > 1 ? 'ok' : 'muted');
+
+    const results = [];
+    for (let i = 0; i < tables.length; i++) {
+      const data = tables[i];
+      log(`--- [${i + 1}/${tables.length}] ${data.formatLabel || data.sheetName} ---`);
+      const bytes = await buildHwpForTableData(data);
+      const outName = outputFileNameForData(f.name, data, i, tables.length);
+      results.push({ data, bytes, outName });
+      log(`결과 준비: ${outName}`, 'ok');
+    }
+
+    renderConversionResults(results);
+    log(`변환 완료: HWP ${results.length}개`, 'ok');
   } catch (e) {
     log(`[변환 실패] ${errMsg(e)}`, 'err');
     console.error(e);
@@ -2140,6 +2231,8 @@ async function convertSelectedFile() {
 // ────────────────────────────────────────────────────────────────
 $file.addEventListener('change', () => {
   $btnConvert.disabled = !$file.files[0];
+  $dlSlot.innerHTML = '';
+  resetResults();
 });
 $btnSelftest.addEventListener('click', selftest);
 $btnConvert.addEventListener('click', convertSelectedFile);
