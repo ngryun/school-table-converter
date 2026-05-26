@@ -123,6 +123,107 @@ function findLastDataRowInColumn(sheet, col, firstDataRow, maxRow) {
   return -1;
 }
 
+function findLastDataRowInColumns(sheet, startCol, endCol, firstDataRow, maxRow) {
+  let last = -1;
+  for (let col = startCol; col <= endCol; col++) {
+    last = Math.max(last, findLastDataRowInColumn(sheet, col, firstDataRow, maxRow));
+  }
+  return last;
+}
+
+function isCurriculumLandscapeSheetName(sheetName) {
+  return normalizeCompactText(sheetName) === '교육과정편제표(가로)';
+}
+
+function readCurriculumOrganizationLandscapeTable(wb, arrayBuffer) {
+  const tableStartRow = 5; // B6
+  const titleRows = [0, 1]; // B1, B2
+  const startCol = 1; // B
+  const endCol = 29;  // AD
+  const colCount = endCol - startCol + 1;
+
+  for (let sheetIndex = 0; sheetIndex < wb.SheetNames.length; sheetIndex++) {
+    const sheetName = wb.SheetNames[sheetIndex];
+    if (!isCurriculumLandscapeSheetName(sheetName)) continue;
+
+    const sheet = wb.Sheets[sheetName];
+    if (!sheet || !sheet['!ref']) continue;
+
+    const range = XLSX.utils.decode_range(sheet['!ref']);
+    const lastDataRow = findLastDataRowInColumns(sheet, startCol, endCol, tableStartRow, range.e.r);
+    if (lastDataRow < tableStartRow) continue;
+
+    const rawRowCount = range.e.r - range.s.r + 1;
+    const rawColCount = range.e.c - range.s.c + 1;
+    const titleLines = titleRows
+      .map(row => readSheetCellText(sheet, row, startCol))
+      .filter(Boolean);
+    const titleText = titleLines.join('\n') || '교육과정편제표(가로)';
+    const tableDataRowCount = lastDataRow - tableStartRow + 1;
+    const cells = [];
+
+    for (let r = tableStartRow; r <= lastDataRow; r++) {
+      for (let c = startCol; c <= endCol; c++) {
+        const text = readSheetCellText(sheet, r, c);
+        if (text.length === 0) continue;
+        cells.push({
+          row: r - tableStartRow,
+          col: c - startCol,
+          text,
+        });
+      }
+    }
+
+    const merges = (sheet['!merges'] || [])
+      .filter(m =>
+        m.s.r >= tableStartRow && m.e.r <= lastDataRow &&
+        m.s.c >= startCol && m.e.c <= endCol
+      )
+      .map(m => ({
+        r1: m.s.r - tableStartRow,
+        c1: m.s.c - startCol,
+        r2: m.e.r - tableStartRow,
+        c2: m.e.c - startCol,
+      }));
+
+    const colWidthsExcel = extractColumnWidthsExcel(sheet, arrayBuffer, startCol, colCount, sheetIndex);
+    const borderByCell = parseExcelCellBordersFromXlsxXml(arrayBuffer, sheetIndex, {
+      startRow: tableStartRow,
+      endRow: lastDataRow,
+      startCol,
+      endCol,
+    });
+    const tableRangeLabel = `B6:AD${lastDataRow + 1}`;
+
+    return {
+      sheetName,
+      format: 'curriculumOrganizationLandscape',
+      formatLabel: '교육과정편제표(가로)',
+      titleCell: 'B1/B2',
+      titleLines,
+      titleText,
+      tableRangeLabel,
+      rowCount: tableDataRowCount,
+      colCount,
+      rawRowCount,
+      rawColCount,
+      cells,
+      merges,
+      colWidthsExcel,
+      borderByCell,
+      droppedColIdx: [],
+      selectionRequirement: null,
+      trim: { r1: tableStartRow, c1: startCol, r2: lastDataRow, c2: endCol },
+      hasTitleRow: false,
+      headerRowCount: 1,
+      preserveZeroText: true,
+      forceLandscape: true,
+    };
+  }
+
+  return null;
+}
+
 function readCurriculumOrganizationTable(wb, arrayBuffer) {
   const tableStartRow = 4; // B5
   const titleRow = 1;      // B2
@@ -132,6 +233,8 @@ function readCurriculumOrganizationTable(wb, arrayBuffer) {
 
   for (let sheetIndex = 0; sheetIndex < wb.SheetNames.length; sheetIndex++) {
     const sheetName = wb.SheetNames[sheetIndex];
+    if (isCurriculumLandscapeSheetName(sheetName)) continue;
+
     const sheet = wb.Sheets[sheetName];
     if (!sheet || !sheet['!ref']) continue;
     if (!isCurriculumOrganizationCandidate(sheetName, sheet)) continue;
@@ -269,6 +372,9 @@ async function selftest() {
 // ────────────────────────────────────────────────────────────────
 function readXlsxFirstSheet(arrayBuffer) {
   const wb = XLSX.read(arrayBuffer, { type: 'array' });
+  const curriculumLandscapeData = readCurriculumOrganizationLandscapeTable(wb, arrayBuffer);
+  if (curriculumLandscapeData) return curriculumLandscapeData;
+
   const curriculumData = readCurriculumOrganizationTable(wb, arrayBuffer);
   if (curriculumData) return curriculumData;
 
@@ -654,6 +760,105 @@ function parseColWidthsFromXlsxXml(sheet, arrayBuffer, sheetIndex = 0) {
   }
 }
 
+function parseXmlAttrs(attrText) {
+  const attrs = {};
+  const re = /([A-Za-z_:][\w:.-]*)="([^"]*)"/g;
+  let m;
+  while ((m = re.exec(attrText || '')) !== null) attrs[m[1]] = m[2];
+  return attrs;
+}
+
+function readXlsxBookFiles(arrayBuffer) {
+  const wb = XLSX.read(arrayBuffer, { type: 'array', bookFiles: true });
+  return wb.files || wb.Files || null;
+}
+
+function decodeXlsxFileContent(content) {
+  if (content == null) return '';
+  if (typeof content === 'string') return content;
+  return new TextDecoder('utf-8').decode(content);
+}
+
+function readXlsxFileText(files, targetPath) {
+  if (!files) return '';
+  const normalizedTarget = targetPath.replace(/^\/+/, '').toLowerCase();
+  const key = Object.keys(files).find(k => k.replace(/^\/+/, '').toLowerCase() === normalizedTarget);
+  if (!key) return '';
+  return decodeXlsxFileContent(files[key].content || files[key]);
+}
+
+function parseVisibleBorderSides(borderBlock) {
+  const sides = {};
+  for (const side of ['left', 'right', 'top', 'bottom']) {
+    const re = new RegExp(`<${side}\\b([^>]*)\\/?>(?:[\\s\\S]*?<\\/${side}>)?`, 'i');
+    const match = borderBlock.match(re);
+    const attrs = parseXmlAttrs(match?.[1] || '');
+    sides[side] = !!attrs.style && attrs.style !== 'none';
+  }
+  return sides;
+}
+
+function parseStyleBorderMap(stylesXml) {
+  if (!stylesXml) return [];
+
+  const bordersSection = stylesXml.match(/<borders\b[^>]*>([\s\S]*?)<\/borders>/i)?.[1] || '';
+  const borders = [];
+  const borderRe = /<border\b[^>]*\/>|<border\b[^>]*>[\s\S]*?<\/border>/gi;
+  let borderMatch;
+  while ((borderMatch = borderRe.exec(bordersSection)) !== null) {
+    borders.push(parseVisibleBorderSides(borderMatch[0]));
+  }
+
+  const cellXfsSection = stylesXml.match(/<cellXfs\b[^>]*>([\s\S]*?)<\/cellXfs>/i)?.[1] || '';
+  const styleBorders = [];
+  const xfRe = /<xf\b([^>]*)\/?>/gi;
+  let xfMatch;
+  while ((xfMatch = xfRe.exec(cellXfsSection)) !== null) {
+    const attrs = parseXmlAttrs(xfMatch[1]);
+    const borderId = Number(attrs.borderId || 0);
+    styleBorders.push(borders[borderId] || { left: false, right: false, top: false, bottom: false });
+  }
+
+  return styleBorders;
+}
+
+function hasAnyVisibleBorder(sides) {
+  return !!(sides?.left || sides?.right || sides?.top || sides?.bottom);
+}
+
+function parseExcelCellBordersFromXlsxXml(arrayBuffer, sheetIndex, { startRow, endRow, startCol, endCol }) {
+  const borderByCell = new Map();
+  try {
+    const files = readXlsxBookFiles(arrayBuffer);
+    if (!files) return borderByCell;
+
+    const stylesXml = readXlsxFileText(files, 'xl/styles.xml');
+    const styleBorders = parseStyleBorderMap(stylesXml);
+    if (styleBorders.length === 0) return borderByCell;
+
+    const sheetXml = readXlsxFileText(files, `xl/worksheets/sheet${sheetIndex + 1}.xml`);
+    if (!sheetXml) return borderByCell;
+
+    const cellRe = /<c\b([^>]*)\/?>/gi;
+    let cellMatch;
+    while ((cellMatch = cellRe.exec(sheetXml)) !== null) {
+      const attrs = parseXmlAttrs(cellMatch[1]);
+      if (!attrs.r) continue;
+      const addr = XLSX.utils.decode_cell(attrs.r);
+      if (addr.r < startRow || addr.r > endRow || addr.c < startCol || addr.c > endCol) continue;
+
+      const styleIdx = Number(attrs.s || 0);
+      const border = styleBorders[styleIdx];
+      if (!hasAnyVisibleBorder(border)) continue;
+
+      borderByCell.set(`${addr.r - startRow},${addr.c - startCol}`, border);
+    }
+  } catch (e) {
+    console.warn('[debug] parseExcelCellBordersFromXlsxXml 실패:', e);
+  }
+  return borderByCell;
+}
+
 const TABLE_THEME = {
   titleBg: '#18324A',
   headerBg: '#245C8F',
@@ -1036,7 +1241,10 @@ function getTableCellKind(row, col, hasTitleRow, headerRowCount) {
   return isTitle ? 'title' : isHeader ? 'header' : isIndex ? 'index' : 'body';
 }
 
-function getCellFillColor(kind, row, col) {
+function getCellFillColor(kind, row, col, data = null, text = '') {
+  if (data?.format === 'curriculumOrganizationLandscape' && !String(text ?? '').trim()) {
+    return TABLE_THEME.rowEven;
+  }
   if (kind === 'title') return TABLE_THEME.titleBg;
   if (kind === 'header') return TABLE_THEME.headerBg;
   if (kind === 'index') return row % 2 === 1 ? TABLE_THEME.indexOdd : TABLE_THEME.indexEven;
@@ -1050,6 +1258,35 @@ function getCellBorderColor(kind, fillHex) {
   if (kind === 'title') return TABLE_THEME.titleBg;
   if (kind === 'header') return TABLE_THEME.headerBorder;
   return TABLE_THEME.grid;
+}
+
+function hwpBorderSide(visible, visibleColor, hiddenColor) {
+  return {
+    type: visible ? 1 : 0,
+    width: visible ? 1 : 0,
+    color: visible ? visibleColor : hiddenColor,
+  };
+}
+
+function getCellBorderProps(data, key, kind, fillColor, borderColor) {
+  if (data?.format !== 'curriculumOrganizationLandscape') {
+    return {
+      borderLeft: { type: 1, width: 1, color: borderColor },
+      borderRight: { type: 1, width: 1, color: borderColor },
+      borderTop: { type: 1, width: 1, color: borderColor },
+      borderBottom: { type: 1, width: 1, color: borderColor },
+    };
+  }
+
+  const border = data.borderByCell?.get(key) || {};
+  const hiddenColor = fillColor;
+  const visibleColor = kind === 'header' ? TABLE_THEME.headerBorder : TABLE_THEME.grid;
+  return {
+    borderLeft: hwpBorderSide(!!border.left, visibleColor, hiddenColor),
+    borderRight: hwpBorderSide(!!border.right, visibleColor, hiddenColor),
+    borderTop: hwpBorderSide(!!border.top, visibleColor, hiddenColor),
+    borderBottom: hwpBorderSide(!!border.bottom, visibleColor, hiddenColor),
+  };
 }
 
 function getHeaderTextsByColumn(data, hasTitleRow, headerRowCount = getHeaderRowCount(data, hasTitleRow)) {
@@ -1097,7 +1334,31 @@ function computeCurriculumOrganizationColWidths(colCount, availableWidth) {
   return scaled;
 }
 
+function computeProportionalColWidths(colWidthsExcel, availableWidth, minWidth = 1300) {
+  const count = colWidthsExcel.length;
+  if (count === 0) return [];
+
+  const minTotal = minWidth * count;
+  if (minTotal >= availableWidth) {
+    const width = Math.max(800, Math.floor(availableWidth / count));
+    const widths = new Array(count).fill(width);
+    widths[widths.length - 1] += availableWidth - widths.reduce((sum, item) => sum + item, 0);
+    return widths;
+  }
+
+  const weights = colWidthsExcel.map(width => Math.max(1, Number(width) || 1));
+  const weightTotal = weights.reduce((sum, width) => sum + width, 0) || 1;
+  const extra = availableWidth - minTotal;
+  const widths = weights.map(weight => Math.floor(minWidth + extra * (weight / weightTotal)));
+  widths[widths.length - 1] += availableWidth - widths.reduce((sum, width) => sum + width, 0);
+  return widths;
+}
+
 function computeHwpColWidths(data, hasTitleRow, availableWidth, headerRowCount = getHeaderRowCount(data, hasTitleRow)) {
+  if (data.format === 'curriculumOrganizationLandscape') {
+    return computeProportionalColWidths(data.colWidthsExcel, availableWidth, 1250);
+  }
+
   if (data.format === 'curriculumOrganization') {
     return computeCurriculumOrganizationColWidths(data.colCount, availableWidth);
   }
@@ -1192,28 +1453,34 @@ function createDocumentTitleStyle(doc) {
 }
 
 function insertDocumentTitle(doc, titleText) {
-  const title = String(titleText ?? '').trim();
-  if (!title) return 0;
+  const titleLines = String(titleText ?? '')
+    .split(/\r\n|\r|\n/)
+    .map(line => line.trim())
+    .filter(Boolean);
+  if (titleLines.length === 0) return 0;
 
   const titleStyleId = createDocumentTitleStyle(doc);
-  parseJsonResult(doc.insertText(0, 0, 0, title), 'insertDocumentTitle');
-  parseJsonResult(doc.applyStyle(0, 0, titleStyleId), 'applyDocumentTitleStyle');
-  parseJsonResult(doc.applyParaFormat(0, 0, JSON.stringify({
-    alignment: 'center',
-    lineSpacing: 130,
-  })), 'applyDocumentTitlePara');
-  try {
-    parseJsonResult(doc.applyCharFormat(0, 0, 0, title.length, JSON.stringify({
-      bold: true,
-      fontSize: 1500,
-      fontFamily: TABLE_FONT_FAMILY,
-      textColor: TABLE_THEME.text,
-    })), 'applyDocumentTitleChar');
-  } catch (e) {
-    console.warn('[debug] 제목 글자 서식 일부 적용 실패:', e);
+  for (let i = 0; i < titleLines.length; i++) {
+    const title = titleLines[i];
+    parseJsonResult(doc.insertText(0, i, 0, title), `insertDocumentTitle(${i})`);
+    parseJsonResult(doc.applyStyle(0, i, titleStyleId), `applyDocumentTitleStyle(${i})`);
+    parseJsonResult(doc.applyParaFormat(0, i, JSON.stringify({
+      alignment: 'center',
+      lineSpacing: 130,
+    })), `applyDocumentTitlePara(${i})`);
+    try {
+      parseJsonResult(doc.applyCharFormat(0, i, 0, title.length, JSON.stringify({
+        bold: true,
+        fontSize: 1500,
+        fontFamily: TABLE_FONT_FAMILY,
+        textColor: TABLE_THEME.text,
+      })), `applyDocumentTitleChar(${i})`);
+    } catch (e) {
+      console.warn('[debug] 제목 글자 서식 일부 적용 실패:', e);
+    }
+    parseJsonResult(doc.splitParagraph(0, i, title.length), `splitParagraphAfterTitle(${i})`);
   }
-  parseJsonResult(doc.splitParagraph(0, 0, title.length), 'splitParagraphAfterTitle');
-  return 1;
+  return titleLines.length;
 }
 
 function insertCellParagraphs(doc, paraIdx, ctrlIdx, cellIdx, paragraphs, label) {
@@ -1235,13 +1502,14 @@ function insertCellParagraphs(doc, paraIdx, ctrlIdx, cellIdx, paragraphs, label)
 }
 
 function createTableTextStyles(doc, data) {
-  const isCurriculum = data?.format === 'curriculumOrganization';
+  const isCurriculum = data?.format === 'curriculumOrganization' || data?.format === 'curriculumOrganizationLandscape';
+  const isLandscapeCurriculum = data?.format === 'curriculumOrganizationLandscape';
   const defs = {
     title:  { name: 'Minimal Title',  char: { bold: true, fontSize: 1080, fontFamily: TABLE_FONT_FAMILY, textColor: TABLE_THEME.whiteText } },
-    header: { name: 'Minimal Header', char: { bold: true, fontSize: isCurriculum ? 760 : 930, fontFamily: TABLE_FONT_FAMILY, textColor: TABLE_THEME.whiteText } },
-    index:  { name: 'Minimal Index',  char: { bold: true, fontSize: isCurriculum ? 820 : 880, fontFamily: TABLE_FONT_FAMILY, textColor: TABLE_THEME.indexText } },
-    body:   { name: 'Minimal Body',   char: { bold: false, fontSize: isCurriculum ? 820 : 860, fontFamily: TABLE_FONT_FAMILY, textColor: TABLE_THEME.text } },
-    selectionCredit: { name: 'Selection Credit', char: { bold: true, fontSize: isCurriculum ? 860 : 900, fontFamily: TABLE_FONT_FAMILY, textColor: TABLE_THEME.text } },
+    header: { name: 'Minimal Header', char: { bold: true, fontSize: isLandscapeCurriculum ? 620 : isCurriculum ? 760 : 930, fontFamily: TABLE_FONT_FAMILY, textColor: TABLE_THEME.whiteText } },
+    index:  { name: 'Minimal Index',  char: { bold: true, fontSize: isLandscapeCurriculum ? 650 : isCurriculum ? 820 : 880, fontFamily: TABLE_FONT_FAMILY, textColor: TABLE_THEME.indexText } },
+    body:   { name: 'Minimal Body',   char: { bold: false, fontSize: isLandscapeCurriculum ? 650 : isCurriculum ? 820 : 860, fontFamily: TABLE_FONT_FAMILY, textColor: TABLE_THEME.text } },
+    selectionCredit: { name: 'Selection Credit', char: { bold: true, fontSize: isLandscapeCurriculum ? 680 : isCurriculum ? 860 : 900, fontFamily: TABLE_FONT_FAMILY, textColor: TABLE_THEME.text } },
   };
 
   const styleIds = {};
@@ -1307,7 +1575,7 @@ async function convertSelectedFile() {
     const PAGE_SHORT = 59528;
     const PAGE_LONG = 84186;
     const MIN_MARGIN = 10 * HWPUNIT_PER_MM;  // 10mm = 2830 HWPUNIT
-    const useLandscape = data.colCount >= 8;
+    const useLandscape = !!data.forceLandscape || data.colCount >= 8;
     const pageWidth = useLandscape ? PAGE_LONG : PAGE_SHORT;
     const pageHeight = useLandscape ? PAGE_SHORT : PAGE_LONG;
     parseJsonResult(doc.setPageDef(0, JSON.stringify({
@@ -1342,7 +1610,9 @@ async function convertSelectedFile() {
     // 한글 일부 환경에서 용지 방향이 늦게/다르게 반영되어도 넘치지 않도록,
     // 열폭은 세로 A4 본문 폭을 기준으로 한 번 더 안전하게 제한한다.
     const portraitSafeWidth = PAGE_SHORT - (MIN_MARGIN * 2) - 1200;
-    const tableWidth = data.format === 'curriculumOrganization'
+    const tableWidth = data.format === 'curriculumOrganizationLandscape'
+      ? Math.max(52000, pageContentWidth - 500)
+      : data.format === 'curriculumOrganization'
       ? Math.max(36000, Math.min(pageContentWidth - 2600, portraitSafeWidth - 500))
       : Math.max(24000, Math.min(pageContentWidth - 1200, portraitSafeWidth));
     const targetColWidths = computeHwpColWidths(data, hasTitleRow, tableWidth, headerRowCount);
@@ -1411,22 +1681,22 @@ async function convertSelectedFile() {
         try {
           try {
             const beforeCellProps = JSON.parse(doc.getCellProperties(0, paraIdx, ctrlIdx, cellIdx));
-            const fillColor = getCellFillColor(kind, row, col);
+            const fillColor = getCellFillColor(kind, row, col, data, text);
             const borderColor = getCellBorderColor(kind, fillColor);
+            const borderProps = getCellBorderProps(data, key, kind, fillColor, borderColor);
+            const isLandscapeCurriculum = data.format === 'curriculumOrganizationLandscape';
             parseJsonResult(
               doc.setCellProperties(0, paraIdx, ctrlIdx, cellIdx, JSON.stringify({
                 width: targetColWidths[col] || beforeCellProps.width,
-                height: Math.max(beforeCellProps.height || 0, kind === 'header' ? 1750 : 1280),
+                height: Math.max(beforeCellProps.height || 0,
+                  isLandscapeCurriculum ? (kind === 'header' ? 1350 : 1050) : (kind === 'header' ? 1750 : 1280)),
                 isHeader: kind === 'title' || kind === 'header',
                 verticalAlign: 1,
-                paddingLeft: kind === 'header' ? 120 : 220,
-                paddingRight: kind === 'header' ? 120 : 220,
-                paddingTop: kind === 'header' ? 80 : 140,
-                paddingBottom: kind === 'header' ? 80 : 140,
-                borderLeft: { type: 1, width: 1, color: borderColor },
-                borderRight: { type: 1, width: 1, color: borderColor },
-                borderTop: { type: 1, width: 1, color: borderColor },
-                borderBottom: { type: 1, width: 1, color: borderColor },
+                paddingLeft: isLandscapeCurriculum ? 60 : kind === 'header' ? 120 : 220,
+                paddingRight: isLandscapeCurriculum ? 60 : kind === 'header' ? 120 : 220,
+                paddingTop: isLandscapeCurriculum ? 50 : kind === 'header' ? 80 : 140,
+                paddingBottom: isLandscapeCurriculum ? 50 : kind === 'header' ? 80 : 140,
+                ...borderProps,
               })),
               `setCellProperties(r=${row},c=${col})`
             );
@@ -1522,4 +1792,4 @@ $file.addEventListener('change', () => {
 $btnSelftest.addEventListener('click', selftest);
 $btnConvert.addEventListener('click', convertSelectedFile);
 
-log('준비됨. 셀프 테스트로 동작 검증 후 xlsx를 선택하세요.', 'muted');
+log('준비됨. 셀프 테스트로 동작 검증 후 xlsx/xls/xlsm 파일을 선택하세요.', 'muted');
