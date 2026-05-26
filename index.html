@@ -2,7 +2,7 @@
 <html lang="ko">
 <head>
 <meta charset="UTF-8">
-<title>엑셀 → 한글 표 변환기</title>
+<title>강원 교육과정편제 프로그램 양식 한글(hwp) 변환 프로그램</title>
 <style>
   :root {
     --ink: #1b2838;
@@ -168,6 +168,10 @@
     text-align: center;
   }
 
+  footer .credit {
+    margin-bottom: 4px;
+  }
+
   footer a {
     color: var(--primary);
     text-decoration: none;
@@ -177,15 +181,14 @@
 </style>
 </head>
 <body>
-  <h1>엑셀 → 한글 표 변환기</h1>
+  <h1>강원 교육과정편제 프로그램 양식 한글(hwp) 변환 프로그램</h1>
 
   <div class="card">
     <div class="row">
-      <label>엑셀 파일:</label>
+      <label>교육청 제출용 엑셀 파일:</label>
       <input id="file" type="file" accept=".xlsx,.xls,.xlsm">
     </div>
     <div class="row">
-      <button id="btnSelftest">셀프 테스트 (3×3 표 1개)</button>
       <button id="btnConvert" disabled>선택한 엑셀 → hwp 변환</button>
       <span id="dlSlot"></span>
     </div>
@@ -200,10 +203,11 @@
   </div>
 
   <footer>
-    <a href="THIRD_PARTY_NOTICES.md">오픈소스 라이선스</a>
+    <div class="credit">제작: 설악고등학교 남궁연</div>
+    <a href="THIRD_PARTY_NOTICES.md">rhwp 및 SheetJS 오픈소스 라이선스</a>
   </footer>
 
   <script src="lib/sheetjs/xlsx.full.min.js"></script>
-  <script type="module" src="app.js?v=20260527-multi-output"></script>
+  <script type="module" src="app.js?v=20260527-office-file-label"></script>
 </body>
 </html>

@@ -1,4 +1,4 @@
-// 엑셀 → 한글 표 변환 PoC
+// 강원 교육과정편제 프로그램 양식 한글(hwp) 변환 프로그램
 // - SheetJS로 xlsx 파싱
 // - rhwp WASM(HwpDocument)으로 표 생성/병합/텍스트 삽입/.hwp 내보내기
 
@@ -7,7 +7,6 @@ import init, { HwpDocument, init_panic_hook } from './lib/rhwp/rhwp.js';
 const $log = document.getElementById('log');
 const $file = document.getElementById('file');
 const $btnConvert = document.getElementById('btnConvert');
-const $btnSelftest = document.getElementById('btnSelftest');
 const $dlSlot = document.getElementById('dlSlot');
 const $results = document.getElementById('results');
 
@@ -18,20 +17,6 @@ function log(msg, cls = '') {
   $log.appendChild(line);
   $log.scrollTop = $log.scrollHeight;
   console.log(msg);
-}
-
-function downloadBytes(bytes, filename) {
-  const blob = new Blob([bytes], { type: 'application/x-hwp' });
-  const url = URL.createObjectURL(blob);
-  $dlSlot.innerHTML = '';
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  a.textContent = `↓ ${filename} 다운로드`;
-  a.className = 'dl';
-  $dlSlot.appendChild(a);
-  // 자동 클릭으로 즉시 저장
-  a.click();
 }
 
 function makeDownloadLink(bytes, filename) {
@@ -137,6 +122,7 @@ function extractColumnWidthsExcel(sheet, arrayBuffer, startCol, colCount, sheetI
 }
 
 function isCurriculumOrganizationCandidate(sheetName, sheet) {
+  if (isCurriculumOrganizationSheetName(sheetName)) return true;
   const titleText = readSheetCellText(sheet, 1, 1); // B2
   const compact = normalizeCompactText(`${sheetName} ${titleText}`);
   return compact.includes('교육과정편제표');
@@ -158,7 +144,12 @@ function findLastDataRowInColumns(sheet, startCol, endCol, firstDataRow, maxRow)
 }
 
 function isCurriculumLandscapeSheetName(sheetName) {
-  return normalizeCompactText(sheetName) === '교육과정편제표(가로)';
+  return normalizeCompactText(sheetName).endsWith('교육과정편제표(가로)');
+}
+
+function isCurriculumOrganizationSheetName(sheetName) {
+  const compact = normalizeCompactText(sheetName);
+  return compact.endsWith('교육과정편제표') && !compact.endsWith('교육과정편제표(가로)');
 }
 
 function readCurriculumOrganizationLandscapeTable(wb, arrayBuffer) {
@@ -360,51 +351,6 @@ function makeBlankDoc() {
   const doc = HwpDocument.createEmpty();
   parseJsonResult(doc.createBlankDocument(), 'createBlankDocument');
   return doc;
-}
-
-// ────────────────────────────────────────────────────────────────
-// 셀프 테스트: 3×3 표 만들고 첫 셀에 텍스트 + 한 번 병합
-// ────────────────────────────────────────────────────────────────
-async function selftest() {
-  try {
-    await ensureWasm();
-    log('--- 셀프 테스트 시작 ---');
-
-    const doc = makeBlankDoc();
-    log('빈 문서 골격 준비 OK');
-
-    const r = parseJsonResult(doc.createTable(0, 0, 0, 3, 3), 'createTable');
-    const paraIdx = r.paraIdx ?? 0;
-    const ctrlIdx = r.controlIdx ?? 0;
-    log(`createTable(3×3) OK  paraIdx=${paraIdx} ctrlIdx=${ctrlIdx}`);
-
-    // 셀(0,0)에 텍스트
-    parseJsonResult(
-      doc.insertTextInCell(0, paraIdx, ctrlIdx, 0, 0, 0, '안녕하세요'),
-      'insertTextInCell(0,0)'
-    );
-    // 셀(1,1)에 텍스트
-    parseJsonResult(
-      doc.insertTextInCell(0, paraIdx, ctrlIdx, 1 * 3 + 1, 0, 0, '한글 셀'),
-      'insertTextInCell(1,1)'
-    );
-    log('insertTextInCell 2회 OK');
-
-    // 마지막에 (0,0)-(0,2) 병합 (1행 전체)
-    parseJsonResult(
-      doc.mergeTableCells(0, paraIdx, ctrlIdx, 0, 0, 0, 2),
-      'mergeTableCells'
-    );
-    log('mergeTableCells(0,0)-(0,2) OK');
-
-    const bytes = doc.exportHwp();
-    log(`exportHwp() OK  ${bytes.length} bytes`, 'ok');
-    downloadBytes(bytes, 'selftest.hwp');
-    doc.free();
-  } catch (e) {
-    log(`[셀프 테스트 실패] ${errMsg(e)}`, 'err');
-    console.error(e);
-  }
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -1445,15 +1391,21 @@ function buildStyledTableHtml(data, totalPx = 660) {
       const isIndex = !isTitle && !isHeader && c === 0;
       const kind = isTitle ? 'title' : isHeader ? 'header' : isIndex ? 'index' : 'body';
       const fillColor = getCellFillColor(kind, r, c, data, text);
+      const borderColor = getCellBorderColor(kind, fillColor);
+      const borderProps = getCellBorderProps(data, `${r},${c}`, kind, fillColor, borderColor);
       const textFormat = getExcelTextFormat(data, r, c);
       const widthPx = colWidthsPx
         .slice(c, c + span.colSpan)
         .reduce((a, b) => a + b, 0) || 80 * span.colSpan;
+      const cssBorder = side => `1px solid ${side.color}`;
 
       const style = {
         width: `${widthPx}px`,
         height: kind === 'title' ? '34px' : '28px',
-        border: `1px solid ${kind === 'title' ? TABLE_THEME.titleBg : kind === 'header' ? TABLE_THEME.headerBorder : TABLE_THEME.grid}`,
+        'border-left': cssBorder(borderProps.borderLeft),
+        'border-right': cssBorder(borderProps.borderRight),
+        'border-top': cssBorder(borderProps.borderTop),
+        'border-bottom': cssBorder(borderProps.borderBottom),
         padding: kind === 'title' ? '7px 9px' : '5px 7px',
         'text-align': 'center',
         'vertical-align': 'middle',
@@ -2234,7 +2186,6 @@ $file.addEventListener('change', () => {
   $dlSlot.innerHTML = '';
   resetResults();
 });
-$btnSelftest.addEventListener('click', selftest);
 $btnConvert.addEventListener('click', convertSelectedFile);
 
-log('준비됨. 셀프 테스트로 동작 검증 후 xlsx/xls/xlsm 파일을 선택하세요.', 'muted');
+log('준비됨. xlsx/xls/xlsm 파일을 선택하세요.', 'muted');
