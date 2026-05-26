@@ -66,11 +66,19 @@ function excelColName(idx) {
   return name;
 }
 
+function normalizeExcelCellText(value) {
+  return String(value ?? '')
+    .replace(/_x000D_/gi, '\n')
+    .replace(/\r\n|\r/g, '\n')
+    .replace(/\n{2,}/g, '\n')
+    .trim();
+}
+
 function readSheetCellText(sheet, row, col) {
   const addr = XLSX.utils.encode_cell({ r: row, c: col });
   const cell = sheet[addr];
   if (!cell) return '';
-  return (cell.w != null ? cell.w : (cell.v != null ? String(cell.v) : '')).trim();
+  return normalizeExcelCellText(cell.w != null ? cell.w : (cell.v != null ? String(cell.v) : ''));
 }
 
 function extractColumnWidthsExcel(sheet, arrayBuffer, startCol, colCount, sheetIndex = 0) {
@@ -158,7 +166,7 @@ function readCurriculumOrganizationLandscapeTable(wb, arrayBuffer) {
     const titleLines = titleRows
       .map(row => readSheetCellText(sheet, row, startCol))
       .filter(Boolean);
-    const titleText = titleLines.join('\n') || '교육과정편제표(가로)';
+    const titleText = titleLines.join(' ') || '교육과정편제표(가로)';
     const tableDataRowCount = lastDataRow - tableStartRow + 1;
     const cells = [];
 
@@ -193,6 +201,12 @@ function readCurriculumOrganizationLandscapeTable(wb, arrayBuffer) {
       startCol,
       endCol,
     });
+    const excelStyleByCell = parseExcelCellStylesFromXlsxXml(arrayBuffer, sheetIndex, {
+      startRow: tableStartRow,
+      endRow: lastDataRow,
+      startCol,
+      endCol,
+    });
     const tableRangeLabel = `B6:AD${lastDataRow + 1}`;
 
     return {
@@ -211,6 +225,7 @@ function readCurriculumOrganizationLandscapeTable(wb, arrayBuffer) {
       merges,
       colWidthsExcel,
       borderByCell,
+      excelStyleByCell,
       droppedColIdx: [],
       selectionRequirement: null,
       trim: { r1: tableStartRow, c1: startCol, r2: lastDataRow, c2: endCol },
@@ -274,6 +289,12 @@ function readCurriculumOrganizationTable(wb, arrayBuffer) {
       }));
 
     const colWidthsExcel = extractColumnWidthsExcel(sheet, arrayBuffer, startCol, colCount, sheetIndex);
+    const excelStyleByCell = parseExcelCellStylesFromXlsxXml(arrayBuffer, sheetIndex, {
+      startRow: tableStartRow,
+      endRow: lastDataRow,
+      startCol,
+      endCol,
+    });
     const tableRangeLabel = `B5:O${lastDataRow + 1}`;
 
     return {
@@ -290,6 +311,7 @@ function readCurriculumOrganizationTable(wb, arrayBuffer) {
       cells,
       merges,
       colWidthsExcel,
+      excelStyleByCell,
       droppedColIdx: [],
       selectionRequirement: null,
       trim: { r1: tableStartRow, c1: startCol, r2: lastDataRow, c2: endCol },
@@ -787,18 +809,208 @@ function readXlsxFileText(files, targetPath) {
   return decodeXlsxFileContent(files[key].content || files[key]);
 }
 
-function parseVisibleBorderSides(borderBlock) {
+function normalizeHexColor(value) {
+  const clean = String(value ?? '').replace(/[^0-9A-Fa-f]/g, '').toUpperCase();
+  if (clean.length >= 8) return `#${clean.slice(-6)}`;
+  if (clean.length === 6) return `#${clean}`;
+  return null;
+}
+
+const EXCEL_INDEXED_COLORS = [
+  '#000000', '#FFFFFF', '#FF0000', '#00FF00', '#0000FF', '#FFFF00', '#FF00FF', '#00FFFF',
+  '#000000', '#FFFFFF', '#FF0000', '#00FF00', '#0000FF', '#FFFF00', '#FF00FF', '#00FFFF',
+  '#800000', '#008000', '#000080', '#808000', '#800080', '#008080', '#C0C0C0', '#808080',
+  '#9999FF', '#993366', '#FFFFCC', '#CCFFFF', '#660066', '#FF8080', '#0066CC', '#CCCCFF',
+  '#000080', '#FF00FF', '#FFFF00', '#00FFFF', '#800080', '#800000', '#008080', '#0000FF',
+  '#00CCFF', '#CCFFFF', '#CCFFCC', '#FFFF99', '#99CCFF', '#FF99CC', '#CC99FF', '#FFCC99',
+  '#3366FF', '#33CCCC', '#99CC00', '#FFCC00', '#FF9900', '#FF6600', '#666699', '#969696',
+  '#003366', '#339966', '#003300', '#333300', '#993300', '#993366', '#333399', '#333333',
+];
+
+function getFirstXmlTagBlock(xml, tagName) {
+  const re = new RegExp(`<(?:[A-Za-z]+:)?${tagName}\\b[^>]*>([\\s\\S]*?)<\\/(?:[A-Za-z]+:)?${tagName}>`, 'i');
+  return xml.match(re)?.[1] || '';
+}
+
+function parseThemeColorMap(themeXml) {
+  const scheme = getFirstXmlTagBlock(themeXml || '', 'clrScheme');
+  if (!scheme) return [];
+
+  const names = ['lt1', 'dk1', 'lt2', 'dk2', 'accent1', 'accent2', 'accent3', 'accent4', 'accent5', 'accent6', 'hlink', 'folHlink'];
+  return names.map(name => {
+    const block = getFirstXmlTagBlock(scheme, name);
+    if (!block) return null;
+
+    const srgb = block.match(/<(?:[A-Za-z]+:)?srgbClr\b([^>]*)\/?>/i);
+    if (srgb) return normalizeHexColor(parseXmlAttrs(srgb[1]).val);
+
+    const sys = block.match(/<(?:[A-Za-z]+:)?sysClr\b([^>]*)\/?>/i);
+    if (sys) return normalizeHexColor(parseXmlAttrs(sys[1]).lastClr);
+
+    return null;
+  });
+}
+
+function applyExcelTint(hex, tintValue) {
+  const tint = Number(tintValue || 0);
+  if (!hex || !isFinite(tint) || tint === 0) return hex;
+  const clean = hex.replace('#', '');
+  const channels = [0, 2, 4].map(offset => parseInt(clean.slice(offset, offset + 2), 16) || 0);
+  const tinted = channels.map(channel => {
+    const next = tint < 0
+      ? channel * (1 + tint)
+      : channel * (1 - tint) + 255 * tint;
+    return Math.max(0, Math.min(255, Math.round(next)));
+  });
+  return `#${tinted.map(value => value.toString(16).padStart(2, '0')).join('').toUpperCase()}`;
+}
+
+function excelColorAttrsToHex(attrs, themeColors = []) {
+  if (!attrs || attrs.auto === '1') return null;
+  if (attrs.rgb) return normalizeHexColor(attrs.rgb);
+  if (attrs.indexed != null) {
+    const indexed = Number(attrs.indexed);
+    return EXCEL_INDEXED_COLORS[indexed] || null;
+  }
+  if (attrs.theme != null) {
+    const themeColor = themeColors[Number(attrs.theme)];
+    return themeColor ? applyExcelTint(themeColor, attrs.tint) : null;
+  }
+  return null;
+}
+
+function parseExcelColorTag(block, tagName, themeColors) {
+  const match = block.match(new RegExp(`<${tagName}\\b([^>]*)\\/?>`, 'i'));
+  return match ? excelColorAttrsToHex(parseXmlAttrs(match[1]), themeColors) : null;
+}
+
+function parseStyleFillColors(stylesXml, themeColors) {
+  const fillsSection = stylesXml.match(/<fills\b[^>]*>([\s\S]*?)<\/fills>/i)?.[1] || '';
+  const fills = [];
+  const fillRe = /<fill\b[^>]*\/>|<fill\b[^>]*>[\s\S]*?<\/fill>/gi;
+  let fillMatch;
+  while ((fillMatch = fillRe.exec(fillsSection)) !== null) {
+    const block = fillMatch[0];
+    const patternAttrs = parseXmlAttrs(block.match(/<patternFill\b([^>]*)/i)?.[1] || '');
+    const patternType = String(patternAttrs.patternType || '').toLowerCase();
+    if (patternType === 'none' || patternType === 'gray125') {
+      fills.push(null);
+      continue;
+    }
+    fills.push(
+      parseExcelColorTag(block, 'fgColor', themeColors) ||
+      parseExcelColorTag(block, 'bgColor', themeColors) ||
+      null
+    );
+  }
+  return fills;
+}
+
+function parseStyleFonts(stylesXml, themeColors) {
+  const fontsSection = stylesXml.match(/<fonts\b[^>]*>([\s\S]*?)<\/fonts>/i)?.[1] || '';
+  const fonts = [];
+  const fontRe = /<font\b[^>]*\/>|<font\b[^>]*>[\s\S]*?<\/font>/gi;
+  let fontMatch;
+  while ((fontMatch = fontRe.exec(fontsSection)) !== null) {
+    const block = fontMatch[0];
+    const color = parseExcelColorTag(block, 'color', themeColors);
+    fonts.push({
+      textColor: color,
+      bold: /<b\b[^>]*\/?>/i.test(block),
+    });
+  }
+  return fonts;
+}
+
+function parseStyleFormatMap(stylesXml, themeXml) {
+  if (!stylesXml) return [];
+
+  const themeColors = parseThemeColorMap(themeXml);
+  const fills = parseStyleFillColors(stylesXml, themeColors);
+  const fonts = parseStyleFonts(stylesXml, themeColors);
+  const borders = parseStyleBorderMap(stylesXml, themeColors);
+
+  const cellXfsSection = stylesXml.match(/<cellXfs\b[^>]*>([\s\S]*?)<\/cellXfs>/i)?.[1] || '';
+  const styles = [];
+  const xfRe = /<xf\b([^>]*)\/?>/gi;
+  let xfMatch;
+  while ((xfMatch = xfRe.exec(cellXfsSection)) !== null) {
+    const attrs = parseXmlAttrs(xfMatch[1]);
+    const fillId = Number(attrs.fillId || 0);
+    const fontId = Number(attrs.fontId || 0);
+    const borderId = Number(attrs.borderId || 0);
+    const font = fonts[fontId] || {};
+    const usesCustomFont = attrs.applyFont === '1' || fontId > 0;
+    styles.push({
+      fillColor: fills[fillId] || null,
+      textColor: usesCustomFont ? (font.textColor || null) : null,
+      bold: usesCustomFont && font.bold ? true : null,
+      border: borders[borderId] || { left: null, right: null, top: null, bottom: null },
+    });
+  }
+
+  return styles;
+}
+
+function isNonDefaultExcelStyle(style) {
+  return !!(style?.fillColor || style?.textColor || style?.bold);
+}
+
+function parseExcelCellStylesFromXlsxXml(arrayBuffer, sheetIndex, { startRow, endRow, startCol, endCol }) {
+  const styleByCell = new Map();
+  try {
+    const files = readXlsxBookFiles(arrayBuffer);
+    if (!files) return styleByCell;
+
+    const stylesXml = readXlsxFileText(files, 'xl/styles.xml');
+    const themeXml = readXlsxFileText(files, 'xl/theme/theme1.xml');
+    const styleFormats = parseStyleFormatMap(stylesXml, themeXml);
+    if (styleFormats.length === 0) return styleByCell;
+
+    const sheetXml = readXlsxFileText(files, `xl/worksheets/sheet${sheetIndex + 1}.xml`);
+    if (!sheetXml) return styleByCell;
+
+    const cellRe = /<c\b([^>]*)\/?>/gi;
+    let cellMatch;
+    while ((cellMatch = cellRe.exec(sheetXml)) !== null) {
+      const attrs = parseXmlAttrs(cellMatch[1]);
+      if (!attrs.r) continue;
+      const addr = XLSX.utils.decode_cell(attrs.r);
+      if (addr.r < startRow || addr.r > endRow || addr.c < startCol || addr.c > endCol) continue;
+
+      const style = styleFormats[Number(attrs.s || 0)];
+      if (!isNonDefaultExcelStyle(style)) continue;
+      styleByCell.set(`${addr.r - startRow},${addr.c - startCol}`, {
+        fillColor: style.fillColor,
+        textColor: style.textColor,
+        bold: style.bold,
+      });
+    }
+  } catch (e) {
+    console.warn('[debug] parseExcelCellStylesFromXlsxXml 실패:', e);
+  }
+  return styleByCell;
+}
+
+function parseBorderSide(borderBlock, side, themeColors) {
+  const re = new RegExp(`<${side}\\b([^>]*)>([\\s\\S]*?)<\\/${side}>|<${side}\\b([^>]*)\\/?>`, 'i');
+  const match = borderBlock.match(re);
+  const attrs = parseXmlAttrs(match?.[1] || match?.[3] || '');
+  const inner = match?.[2] || '';
+  const visible = !!attrs.style && attrs.style !== 'none';
+  const color = visible ? parseExcelColorTag(inner, 'color', themeColors) : null;
+  return { visible, color };
+}
+
+function parseVisibleBorderSides(borderBlock, themeColors = []) {
   const sides = {};
   for (const side of ['left', 'right', 'top', 'bottom']) {
-    const re = new RegExp(`<${side}\\b([^>]*)\\/?>(?:[\\s\\S]*?<\\/${side}>)?`, 'i');
-    const match = borderBlock.match(re);
-    const attrs = parseXmlAttrs(match?.[1] || '');
-    sides[side] = !!attrs.style && attrs.style !== 'none';
+    sides[side] = parseBorderSide(borderBlock, side, themeColors);
   }
   return sides;
 }
 
-function parseStyleBorderMap(stylesXml) {
+function parseStyleBorderMap(stylesXml, themeColors = []) {
   if (!stylesXml) return [];
 
   const bordersSection = stylesXml.match(/<borders\b[^>]*>([\s\S]*?)<\/borders>/i)?.[1] || '';
@@ -806,7 +1018,7 @@ function parseStyleBorderMap(stylesXml) {
   const borderRe = /<border\b[^>]*\/>|<border\b[^>]*>[\s\S]*?<\/border>/gi;
   let borderMatch;
   while ((borderMatch = borderRe.exec(bordersSection)) !== null) {
-    borders.push(parseVisibleBorderSides(borderMatch[0]));
+    borders.push(parseVisibleBorderSides(borderMatch[0], themeColors));
   }
 
   const cellXfsSection = stylesXml.match(/<cellXfs\b[^>]*>([\s\S]*?)<\/cellXfs>/i)?.[1] || '';
@@ -816,14 +1028,27 @@ function parseStyleBorderMap(stylesXml) {
   while ((xfMatch = xfRe.exec(cellXfsSection)) !== null) {
     const attrs = parseXmlAttrs(xfMatch[1]);
     const borderId = Number(attrs.borderId || 0);
-    styleBorders.push(borders[borderId] || { left: false, right: false, top: false, bottom: false });
+    styleBorders.push(borders[borderId] || { left: null, right: null, top: null, bottom: null });
   }
 
   return styleBorders;
 }
 
+function isBorderSideVisible(side) {
+  return typeof side === 'object' && side !== null ? !!side.visible : !!side;
+}
+
+function getBorderSideColor(side, fallbackColor) {
+  return (typeof side === 'object' && side?.color) ? side.color : fallbackColor;
+}
+
 function hasAnyVisibleBorder(sides) {
-  return !!(sides?.left || sides?.right || sides?.top || sides?.bottom);
+  return !!(
+    isBorderSideVisible(sides?.left) ||
+    isBorderSideVisible(sides?.right) ||
+    isBorderSideVisible(sides?.top) ||
+    isBorderSideVisible(sides?.bottom)
+  );
 }
 
 function parseExcelCellBordersFromXlsxXml(arrayBuffer, sheetIndex, { startRow, endRow, startCol, endCol }) {
@@ -833,7 +1058,8 @@ function parseExcelCellBordersFromXlsxXml(arrayBuffer, sheetIndex, { startRow, e
     if (!files) return borderByCell;
 
     const stylesXml = readXlsxFileText(files, 'xl/styles.xml');
-    const styleBorders = parseStyleBorderMap(stylesXml);
+    const themeXml = readXlsxFileText(files, 'xl/theme/theme1.xml');
+    const styleBorders = parseStyleBorderMap(stylesXml, parseThemeColorMap(themeXml));
     if (styleBorders.length === 0) return borderByCell;
 
     const sheetXml = readXlsxFileText(files, `xl/worksheets/sheet${sheetIndex + 1}.xml`);
@@ -1241,30 +1467,81 @@ function getTableCellKind(row, col, hasTitleRow, headerRowCount) {
   return isTitle ? 'title' : isHeader ? 'header' : isIndex ? 'index' : 'body';
 }
 
+function getExcelCellStyle(data, row, col) {
+  return data?.excelStyleByCell?.get(`${row},${col}`) || null;
+}
+
+function parseHexRgb(hex) {
+  const normalized = normalizeHexColor(hex);
+  if (!normalized) return null;
+  const clean = normalized.replace('#', '');
+  return [0, 2, 4].map(offset => parseInt(clean.slice(offset, offset + 2), 16) || 0);
+}
+
+function rgbToHex(rgb) {
+  return `#${rgb.map(value =>
+    Math.max(0, Math.min(255, Math.round(value))).toString(16).padStart(2, '0')
+  ).join('').toUpperCase()}`;
+}
+
+function mixHexColors(hexA, hexB, amountB = 0.1) {
+  const a = parseHexRgb(hexA);
+  const b = parseHexRgb(hexB);
+  if (!a || !b) return normalizeHexColor(hexA) || normalizeHexColor(hexB) || TABLE_THEME.grid;
+  const amountA = 1 - amountB;
+  return rgbToHex(a.map((channel, idx) => channel * amountA + b[idx] * amountB));
+}
+
 function getCellFillColor(kind, row, col, data = null, text = '') {
-  if (data?.format === 'curriculumOrganizationLandscape' && !String(text ?? '').trim()) {
-    return TABLE_THEME.rowEven;
-  }
-  if (kind === 'title') return TABLE_THEME.titleBg;
-  if (kind === 'header') return TABLE_THEME.headerBg;
-  if (kind === 'index') return row % 2 === 1 ? TABLE_THEME.indexOdd : TABLE_THEME.indexEven;
-  return row % 2 === 1 ? TABLE_THEME.rowOdd : TABLE_THEME.rowEven;
+  const excelFill = getExcelCellStyle(data, row, col)?.fillColor;
+  const hasText = String(text ?? '').trim().length > 0;
+  const excelBorder = data?.borderByCell?.get(`${row},${col}`);
+  if (excelFill && (hasText || hasAnyVisibleBorder(excelBorder))) return excelFill;
+  return TABLE_THEME.rowEven;
 }
 
 function getCellBorderColor(kind, fillHex) {
   // rhwp가 같은 테두리 스타일을 하나의 BorderFill로 공유하므로,
   // 배경색별로 눈에 거의 띄지 않는 테두리 차이를 줘서 채우기 레코드를 분리한다.
   if (BORDER_COLOR_BY_FILL_COLOR[fillHex]) return BORDER_COLOR_BY_FILL_COLOR[fillHex];
-  if (kind === 'title') return TABLE_THEME.titleBg;
-  if (kind === 'header') return TABLE_THEME.headerBorder;
-  return TABLE_THEME.grid;
+  if (kind === 'title') return mixHexColors(TABLE_THEME.titleBg, fillHex, 0.08);
+  if (kind === 'header') return mixHexColors(TABLE_THEME.headerBorder, fillHex, 0.08);
+  return mixHexColors(TABLE_THEME.grid, fillHex, 0.08);
 }
 
 function hwpBorderSide(visible, visibleColor, hiddenColor) {
   return {
-    type: visible ? 1 : 0,
-    width: visible ? 1 : 0,
+    type: 1,
+    width: 1,
     color: visible ? visibleColor : hiddenColor,
+  };
+}
+
+const ADJACENT_BORDER_SIDE = {
+  left: { dr: 0, dc: -1, opposite: 'right' },
+  right: { dr: 0, dc: 1, opposite: 'left' },
+  top: { dr: -1, dc: 0, opposite: 'bottom' },
+  bottom: { dr: 1, dc: 0, opposite: 'top' },
+};
+
+function getAdjacentBorderSide(data, row, col, sideName) {
+  const spec = ADJACENT_BORDER_SIDE[sideName];
+  if (!spec) return null;
+  const nextRow = row + spec.dr;
+  const nextCol = col + spec.dc;
+  if (nextRow < 0 || nextCol < 0 || nextRow >= data.rowCount || nextCol >= data.colCount) return null;
+  return data.borderByCell?.get(`${nextRow},${nextCol}`)?.[spec.opposite] || null;
+}
+
+function resolveSharedBorderSide(data, row, col, sideName, fallbackColor, fillColor) {
+  const border = data.borderByCell?.get(`${row},${col}`) || {};
+  const ownSide = border[sideName];
+  const adjacentSide = getAdjacentBorderSide(data, row, col, sideName);
+  const visible = isBorderSideVisible(ownSide) || isBorderSideVisible(adjacentSide);
+  const colorSource = isBorderSideVisible(ownSide) ? ownSide : adjacentSide;
+  return {
+    visible,
+    color: mixHexColors(getBorderSideColor(colorSource, fallbackColor), fillColor, 0.04),
   };
 }
 
@@ -1278,15 +1555,40 @@ function getCellBorderProps(data, key, kind, fillColor, borderColor) {
     };
   }
 
-  const border = data.borderByCell?.get(key) || {};
+  const [row, col] = key.split(',').map(Number);
   const hiddenColor = fillColor;
-  const visibleColor = kind === 'header' ? TABLE_THEME.headerBorder : TABLE_THEME.grid;
+  const baseVisibleColor = kind === 'header' ? TABLE_THEME.headerBorder : TABLE_THEME.grid;
+  const visibleColor = mixHexColors(baseVisibleColor, fillColor, 0.08);
+  const left = resolveSharedBorderSide(data, row, col, 'left', visibleColor, fillColor);
+  const right = resolveSharedBorderSide(data, row, col, 'right', visibleColor, fillColor);
+  const top = resolveSharedBorderSide(data, row, col, 'top', visibleColor, fillColor);
+  const bottom = resolveSharedBorderSide(data, row, col, 'bottom', visibleColor, fillColor);
   return {
-    borderLeft: hwpBorderSide(!!border.left, visibleColor, hiddenColor),
-    borderRight: hwpBorderSide(!!border.right, visibleColor, hiddenColor),
-    borderTop: hwpBorderSide(!!border.top, visibleColor, hiddenColor),
-    borderBottom: hwpBorderSide(!!border.bottom, visibleColor, hiddenColor),
+    borderLeft: hwpBorderSide(left.visible, left.color, hiddenColor),
+    borderRight: hwpBorderSide(right.visible, right.color, hiddenColor),
+    borderTop: hwpBorderSide(top.visible, top.color, hiddenColor),
+    borderBottom: hwpBorderSide(bottom.visible, bottom.color, hiddenColor),
   };
+}
+
+function getExcelTextFormat(data, row, col) {
+  const style = getExcelCellStyle(data, row, col);
+  const props = {};
+  if (style?.textColor) props.textColor = style.textColor;
+  if (style?.bold) props.bold = true;
+  return props;
+}
+
+function hasTextFormatProps(props) {
+  return props && Object.keys(props).length > 0;
+}
+
+function getLandscapeCellHeight(kind, paragraphCount) {
+  const lines = Math.max(1, Number(paragraphCount) || 1);
+  if (kind === 'title' || kind === 'header') {
+    return 980 + ((lines - 1) * 320);
+  }
+  return 760 + ((lines - 1) * 360);
 }
 
 function getHeaderTextsByColumn(data, hasTitleRow, headerRowCount = getHeaderRowCount(data, hasTitleRow)) {
@@ -1409,11 +1711,19 @@ function parseSelectionCreditLayout(text) {
   };
 }
 
+function splitCellTextParagraphs(text) {
+  return normalizeExcelCellText(text)
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean);
+}
+
 function buildDisplayTextByCell(data, hasTitleRow, headerRowCount = getHeaderRowCount(data, hasTitleRow)) {
   const lastHeaderRow = Math.max(0, headerRowCount - 1);
   const roles = getHeaderTextsByColumn(data, hasTitleRow, headerRowCount).map(getColumnRole);
   const textByCell = new Map();
   const selectionCreditByCell = new Map();
+  const paragraphLayoutByCell = new Map();
   let omittedZeroCount = 0;
 
   for (const cell of data.cells) {
@@ -1425,14 +1735,23 @@ function buildDisplayTextByCell(data, hasTitleRow, headerRowCount = getHeaderRow
       text = '';
       omittedZeroCount++;
     }
-    if (selectionCredit && text) selectionCreditByCell.set(key, selectionCredit);
+    const paragraphs = selectionCredit ? selectionCredit.paragraphs : splitCellTextParagraphs(text);
+    text = paragraphs.join('\n');
+    if (selectionCredit && text) {
+      selectionCreditByCell.set(key, selectionCredit);
+    } else if (paragraphs.length > 1) {
+      paragraphLayoutByCell.set(key, { paragraphs });
+    }
     textByCell.set(key, text);
   }
 
-  return { textByCell, selectionCreditByCell, omittedZeroCount };
+  return { textByCell, selectionCreditByCell, paragraphLayoutByCell, omittedZeroCount };
 }
 
-function createDocumentTitleStyle(doc) {
+function createDocumentTitleStyle(doc, data = null) {
+  const isLandscapeCurriculum = data?.format === 'curriculumOrganizationLandscape';
+  const fontSize = isLandscapeCurriculum ? 700 : 1500;
+  const lineSpacing = isLandscapeCurriculum ? 100 : 130;
   const styleId = doc.createStyle(JSON.stringify({
     name: 'Document Title',
     englishName: 'DocumentTitle',
@@ -1443,35 +1762,43 @@ function createDocumentTitleStyle(doc) {
     styleId,
     JSON.stringify({
       bold: true,
-      fontSize: 1500,
+      fontSize,
       fontFamily: TABLE_FONT_FAMILY,
       textColor: TABLE_THEME.text,
     }),
-    JSON.stringify({ alignment: 'center', lineSpacing: 130 })
+    JSON.stringify({ alignment: 'center', lineSpacing, spacingBefore: 0, spacingAfter: 0 })
   );
   return styleId;
 }
 
-function insertDocumentTitle(doc, titleText) {
-  const titleLines = String(titleText ?? '')
+function insertDocumentTitle(doc, titleText, data = null) {
+  const isLandscapeCurriculum = data?.format === 'curriculumOrganizationLandscape';
+  let titleLines = String(titleText ?? '')
     .split(/\r\n|\r|\n/)
     .map(line => line.trim())
     .filter(Boolean);
+  if (isLandscapeCurriculum && titleLines.length > 1) {
+    titleLines = [titleLines.join(' ')];
+  }
   if (titleLines.length === 0) return 0;
 
-  const titleStyleId = createDocumentTitleStyle(doc);
+  const fontSize = isLandscapeCurriculum ? 700 : 1500;
+  const lineSpacing = isLandscapeCurriculum ? 100 : 130;
+  const titleStyleId = createDocumentTitleStyle(doc, data);
   for (let i = 0; i < titleLines.length; i++) {
     const title = titleLines[i];
     parseJsonResult(doc.insertText(0, i, 0, title), `insertDocumentTitle(${i})`);
     parseJsonResult(doc.applyStyle(0, i, titleStyleId), `applyDocumentTitleStyle(${i})`);
     parseJsonResult(doc.applyParaFormat(0, i, JSON.stringify({
       alignment: 'center',
-      lineSpacing: 130,
+      lineSpacing,
+      spacingBefore: 0,
+      spacingAfter: 0,
     })), `applyDocumentTitlePara(${i})`);
     try {
       parseJsonResult(doc.applyCharFormat(0, i, 0, title.length, JSON.stringify({
         bold: true,
-        fontSize: 1500,
+        fontSize,
         fontFamily: TABLE_FONT_FAMILY,
         textColor: TABLE_THEME.text,
       })), `applyDocumentTitleChar(${i})`);
@@ -1505,11 +1832,11 @@ function createTableTextStyles(doc, data) {
   const isCurriculum = data?.format === 'curriculumOrganization' || data?.format === 'curriculumOrganizationLandscape';
   const isLandscapeCurriculum = data?.format === 'curriculumOrganizationLandscape';
   const defs = {
-    title:  { name: 'Minimal Title',  char: { bold: true, fontSize: 1080, fontFamily: TABLE_FONT_FAMILY, textColor: TABLE_THEME.whiteText } },
-    header: { name: 'Minimal Header', char: { bold: true, fontSize: isLandscapeCurriculum ? 620 : isCurriculum ? 760 : 930, fontFamily: TABLE_FONT_FAMILY, textColor: TABLE_THEME.whiteText } },
-    index:  { name: 'Minimal Index',  char: { bold: true, fontSize: isLandscapeCurriculum ? 650 : isCurriculum ? 820 : 880, fontFamily: TABLE_FONT_FAMILY, textColor: TABLE_THEME.indexText } },
-    body:   { name: 'Minimal Body',   char: { bold: false, fontSize: isLandscapeCurriculum ? 650 : isCurriculum ? 820 : 860, fontFamily: TABLE_FONT_FAMILY, textColor: TABLE_THEME.text } },
-    selectionCredit: { name: 'Selection Credit', char: { bold: true, fontSize: isLandscapeCurriculum ? 680 : isCurriculum ? 860 : 900, fontFamily: TABLE_FONT_FAMILY, textColor: TABLE_THEME.text } },
+    title:  { name: 'Minimal Title',  char: { bold: true, fontSize: isLandscapeCurriculum ? 700 : 1080, fontFamily: TABLE_FONT_FAMILY, textColor: TABLE_THEME.text } },
+    header: { name: 'Minimal Header', char: { bold: true, fontSize: isLandscapeCurriculum ? 620 : isCurriculum ? 760 : 930, fontFamily: TABLE_FONT_FAMILY, textColor: TABLE_THEME.text } },
+    index:  { name: 'Minimal Index',  char: { bold: true, fontSize: isLandscapeCurriculum ? 550 : isCurriculum ? 820 : 880, fontFamily: TABLE_FONT_FAMILY, textColor: TABLE_THEME.indexText } },
+    body:   { name: 'Minimal Body',   char: { bold: false, fontSize: isLandscapeCurriculum ? 550 : isCurriculum ? 820 : 860, fontFamily: TABLE_FONT_FAMILY, textColor: TABLE_THEME.text } },
+    selectionCredit: { name: 'Selection Credit', char: { bold: true, fontSize: isLandscapeCurriculum ? 550 : isCurriculum ? 860 : 900, fontFamily: TABLE_FONT_FAMILY, textColor: TABLE_THEME.text } },
   };
 
   const styleIds = {};
@@ -1557,6 +1884,9 @@ async function convertSelectedFile() {
     } else if (data.selectionRequirement?.skippedCount > 0) {
       log('학기별 선택조건 문구를 찾았지만 선택그룹명 열을 찾지 못해 이동하지 않았습니다.', 'muted');
     }
+    if (data.excelStyleByCell?.size > 0) {
+      log(`엑셀 셀 색상/글자색 감지: ${data.excelStyleByCell.size}칸`, 'muted');
+    }
     log(`엑셀 열폭: [${data.colWidthsExcel.map(w => w.toFixed(1)).join(', ')}]`, 'muted');
 
     const doc = makeBlankDoc();
@@ -1576,11 +1906,12 @@ async function convertSelectedFile() {
     const PAGE_LONG = 84186;
     const MIN_MARGIN = 10 * HWPUNIT_PER_MM;  // 10mm = 2830 HWPUNIT
     const useLandscape = !!data.forceLandscape || data.colCount >= 8;
-    const pageWidth = useLandscape ? PAGE_LONG : PAGE_SHORT;
-    const pageHeight = useLandscape ? PAGE_SHORT : PAGE_LONG;
+    const pageDefWidth = PAGE_SHORT;
+    const pageDefHeight = PAGE_LONG;
+    const layoutPageWidth = useLandscape ? PAGE_LONG : PAGE_SHORT;
     parseJsonResult(doc.setPageDef(0, JSON.stringify({
-      width: pageWidth,
-      height: pageHeight,
+      width: pageDefWidth,
+      height: pageDefHeight,
       landscape: useLandscape,
       marginLeft:   MIN_MARGIN,
       marginRight:  MIN_MARGIN,
@@ -1591,7 +1922,7 @@ async function convertSelectedFile() {
     })), 'setPageDef');
     log(`용지: ${useLandscape ? '가로' : '세로'} / 여백 사방 10mm`);
 
-    const tableParaIdx = insertDocumentTitle(doc, data.titleText);
+    const tableParaIdx = insertDocumentTitle(doc, data.titleText, data);
     if (data.titleText) {
       log(`문서 제목 삽입: "${data.titleText}"`, 'muted');
     }
@@ -1606,7 +1937,7 @@ async function convertSelectedFile() {
     const ctrlIdx = r.controlIdx ?? 0;
     const hasTitleRow = data.hasTitleRow ?? detectTitleRow(data);
     const headerRowCount = getHeaderRowCount(data, hasTitleRow);
-    const pageContentWidth = pageWidth - (MIN_MARGIN * 2);
+    const pageContentWidth = layoutPageWidth - (MIN_MARGIN * 2);
     // 한글 일부 환경에서 용지 방향이 늦게/다르게 반영되어도 넘치지 않도록,
     // 열폭은 세로 A4 본문 폭을 기준으로 한 번 더 안전하게 제한한다.
     const portraitSafeWidth = PAGE_SHORT - (MIN_MARGIN * 2) - 1200;
@@ -1616,7 +1947,7 @@ async function convertSelectedFile() {
       ? Math.max(36000, Math.min(pageContentWidth - 2600, portraitSafeWidth - 500))
       : Math.max(24000, Math.min(pageContentWidth - 1200, portraitSafeWidth));
     const targetColWidths = computeHwpColWidths(data, hasTitleRow, tableWidth, headerRowCount);
-    const { textByCell, selectionCreditByCell, omittedZeroCount } = buildDisplayTextByCell(data, hasTitleRow, headerRowCount);
+    const { textByCell, selectionCreditByCell, paragraphLayoutByCell, omittedZeroCount } = buildDisplayTextByCell(data, hasTitleRow, headerRowCount);
     log(`createTable(${data.rowCount}×${data.colCount}) OK  paraIdx=${paraIdx} ctrlIdx=${ctrlIdx}`);
     log(`열폭 최적화: [${targetColWidths.map(w => (w / HWPUNIT_PER_MM).toFixed(1) + 'mm').join(', ')}]`, 'muted');
     if (omittedZeroCount > 0) {
@@ -1644,8 +1975,9 @@ async function convertSelectedFile() {
       if (text.length === 0) continue;
       try {
         const selectionCredit = selectionCreditByCell.get(key);
-        if (selectionCredit) {
-          insertCellParagraphs(doc, paraIdx, ctrlIdx, cellIdx, selectionCredit.paragraphs, `insertSelectionCredit(r=${row},c=${col})`);
+        const paragraphLayout = selectionCredit || paragraphLayoutByCell.get(key);
+        if (paragraphLayout) {
+          insertCellParagraphs(doc, paraIdx, ctrlIdx, cellIdx, paragraphLayout.paragraphs, `insertCellParagraphs(r=${row},c=${col})`);
         } else {
           parseJsonResult(
             doc.insertTextInCell(0, paraIdx, ctrlIdx, cellIdx, 0, 0, text),
@@ -1662,11 +1994,22 @@ async function convertSelectedFile() {
 
     // 3) 서식 — 네이티브 표를 유지하되, 셀별 BorderFill ID를 모아
     //    export 후 HWP DocInfo의 채우기 레코드를 보정한다.
+    const isLandscapeCurriculum = data.format === 'curriculumOrganizationLandscape';
     const styleIdsByKind = createTableTextStyles(doc, data);
-    log('텍스트 스타일: 헤더 흰색 / 본문 절제형 적용', 'muted');
+    log(`텍스트 스타일: ${isLandscapeCurriculum ? '가로 편제표 본문 5.5pt' : '본문 절제형'} 적용`, 'muted');
 
-    const centerParaProps  = JSON.stringify({ alignment: 'center', lineSpacing: 120 });
-    const headerParaProps  = JSON.stringify({ alignment: 'center', lineSpacing: 100 });
+    const centerParaProps  = JSON.stringify({
+      alignment: 'center',
+      lineSpacing: isLandscapeCurriculum ? 86 : 105,
+      spacingBefore: 0,
+      spacingAfter: 0,
+    });
+    const headerParaProps  = JSON.stringify({
+      alignment: 'center',
+      lineSpacing: isLandscapeCurriculum ? 88 : 100,
+      spacingBefore: 0,
+      spacingAfter: 0,
+    });
     const fillByBorderFillId = new Map();
 
     parseJsonResult(doc.beginBatch(), 'beginBatch(format)');
@@ -1677,6 +2020,8 @@ async function convertSelectedFile() {
         const key = `${row},${col}`;
         const text = textByCell.get(key) || '';
         const selectionCredit = selectionCreditByCell.get(key);
+        const paragraphLayout = selectionCredit || paragraphLayoutByCell.get(key);
+        const paragraphCount = paragraphLayout?.paragraphs?.length || 1;
         const kind = getTableCellKind(row, col, hasTitleRow, headerRowCount);
         try {
           try {
@@ -1684,18 +2029,18 @@ async function convertSelectedFile() {
             const fillColor = getCellFillColor(kind, row, col, data, text);
             const borderColor = getCellBorderColor(kind, fillColor);
             const borderProps = getCellBorderProps(data, key, kind, fillColor, borderColor);
-            const isLandscapeCurriculum = data.format === 'curriculumOrganizationLandscape';
             parseJsonResult(
               doc.setCellProperties(0, paraIdx, ctrlIdx, cellIdx, JSON.stringify({
                 width: targetColWidths[col] || beforeCellProps.width,
-                height: Math.max(beforeCellProps.height || 0,
-                  isLandscapeCurriculum ? (kind === 'header' ? 1350 : 1050) : (kind === 'header' ? 1750 : 1280)),
+                height: isLandscapeCurriculum
+                  ? getLandscapeCellHeight(kind, paragraphCount)
+                  : Math.max(beforeCellProps.height || 0, kind === 'header' ? 1750 : 1280),
                 isHeader: kind === 'title' || kind === 'header',
                 verticalAlign: 1,
-                paddingLeft: isLandscapeCurriculum ? 60 : kind === 'header' ? 120 : 220,
-                paddingRight: isLandscapeCurriculum ? 60 : kind === 'header' ? 120 : 220,
-                paddingTop: isLandscapeCurriculum ? 50 : kind === 'header' ? 80 : 140,
-                paddingBottom: isLandscapeCurriculum ? 50 : kind === 'header' ? 80 : 140,
+                paddingLeft: isLandscapeCurriculum ? 35 : kind === 'header' ? 120 : 220,
+                paddingRight: isLandscapeCurriculum ? 35 : kind === 'header' ? 120 : 220,
+                paddingTop: isLandscapeCurriculum ? 20 : kind === 'header' ? 80 : 140,
+                paddingBottom: isLandscapeCurriculum ? 20 : kind === 'header' ? 80 : 140,
                 ...borderProps,
               })),
               `setCellProperties(r=${row},c=${col})`
@@ -1707,7 +2052,7 @@ async function convertSelectedFile() {
             }
             fillByBorderFillId.set(afterCellProps.borderFillId, fillColor);
           } catch (_) {}
-          const paragraphTexts = selectionCredit ? selectionCredit.paragraphs : [text];
+          const paragraphTexts = paragraphLayout ? paragraphLayout.paragraphs : [text];
           for (let cellParaIdx = 0; cellParaIdx < paragraphTexts.length; cellParaIdx++) {
             const paragraphText = paragraphTexts[cellParaIdx] || '';
             if (paragraphText.length > 0) {
@@ -1717,6 +2062,13 @@ async function convertSelectedFile() {
                   styleIdsByKind[styleKey] ?? styleIdsByKind.body),
                 `applyCellStyle(r=${row},c=${col},p=${cellParaIdx})`
               );
+              const excelTextFormat = getExcelTextFormat(data, row, col);
+              if (hasTextFormatProps(excelTextFormat)) {
+                parseJsonResult(
+                  doc.applyCharFormatInCell(0, paraIdx, ctrlIdx, cellIdx, cellParaIdx, 0, paragraphText.length, JSON.stringify(excelTextFormat)),
+                  `applyExcelTextFormat(r=${row},c=${col},p=${cellParaIdx})`
+                );
+              }
               fmtStyleOk++;
             }
             const paraProps = kind === 'header' ? headerParaProps : centerParaProps;
@@ -1734,7 +2086,7 @@ async function convertSelectedFile() {
     }
     parseJsonResult(doc.endBatch(), 'endBatch(format)');
     log(`서식 적용: 스타일 ${fmtStyleOk} / 문단 ${fmtParaOk} / 실패 ${fmtErr}`);
-    log(`색상 테마: 셀 배경 ${fillByBorderFillId.size}개 추적 (${TABLE_THEME.headerBg}, ${TABLE_THEME.indexEven})`, 'muted');
+    log(`색상 처리: 셀 배경 ${fillByBorderFillId.size}개 추적${data.excelStyleByCell?.size ? ' / Excel 색상 우선 적용' : ''}`, 'muted');
 
     // 4) 병합을 마지막에 적용 (큰 영역 우선)
     const sortedMerges = [...data.merges].sort((a, b) => {
