@@ -1394,7 +1394,7 @@ function buildStyledTableHtml(data, totalPx = 660) {
       const fillColor = getCellFillColor(kind, r, c, data, text);
       const borderColor = getCellBorderColor(kind, fillColor);
       const borderProps = getCellBorderProps(data, `${r},${c}`, kind, fillColor, borderColor);
-      const textFormat = getExcelTextFormat(data, r, c);
+      const textFormat = getExcelTextFormat(data, r, c, kind);
       const widthPx = colWidthsPx
         .slice(c, c + span.colSpan)
         .reduce((a, b) => a + b, 0) || 80 * span.colSpan;
@@ -1546,10 +1546,13 @@ function getCellBorderProps(data, key, kind, fillColor, borderColor) {
   };
 }
 
-function getExcelTextFormat(data, row, col) {
+function getExcelTextFormat(data, row, col, kind = null) {
   const style = getExcelCellStyle(data, row, col);
   const props = {};
-  if (style?.textColor) props.textColor = style.textColor;
+  const keepThemeTextColor =
+    data?.format === 'curriculumOrganization' &&
+    (kind === 'title' || kind === 'header');
+  if (style?.textColor && !keepThemeTextColor) props.textColor = style.textColor;
   if (style?.bold) props.bold = true;
   return props;
 }
@@ -2084,7 +2087,7 @@ async function buildHwpForTableData(data) {
                   styleIdsByKind[styleKey] ?? styleIdsByKind.body),
                 `applyCellStyle(r=${row},c=${col},p=${cellParaIdx})`
               );
-              const excelTextFormat = getExcelTextFormat(data, row, col);
+              const excelTextFormat = getExcelTextFormat(data, row, col, kind);
               if (hasTextFormatProps(excelTextFormat)) {
                 parseJsonResult(
                   doc.applyCharFormatInCell(0, paraIdx, ctrlIdx, cellIdx, cellParaIdx, 0, paragraphText.length, JSON.stringify(excelTextFormat)),
