@@ -327,6 +327,7 @@ function readCurriculumOrganizationTable(wb, arrayBuffer) {
       hasTitleRow: false,
       headerRowCount: 2,
       preserveZeroText: true,
+      forcePortrait: true,
     };
   }
 
@@ -1930,7 +1931,11 @@ async function buildHwpForTableData(data) {
     const PAGE_SHORT = 59528;
     const PAGE_LONG = 84186;
     const MIN_MARGIN = 10 * HWPUNIT_PER_MM;
-    const useLandscape = !!data.forceLandscape || data.colCount >= 8;
+    const useLandscape = data.forceLandscape
+      ? true
+      : data.forcePortrait
+      ? false
+      : data.colCount >= 8;
     const pageDefWidth = PAGE_SHORT;
     const pageDefHeight = PAGE_LONG;
     const layoutPageWidth = useLandscape ? PAGE_LONG : PAGE_SHORT;
